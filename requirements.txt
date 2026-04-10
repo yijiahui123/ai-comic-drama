@@ -1,0 +1,20 @@
+# AI Comic Drama — Python dependencies
+# Python 3.12+ required
+
+# --- Async HTTP ---
+aiohttp>=3.9.0
+
+# --- Data modelling & validation ---
+pydantic>=2.5.0
+
+# --- Configuration ---
+pyyaml>=6.0.1
+
+# --- Video editing ---
+moviepy>=1.0.3
+
+# --- Speech recognition (subtitle generation) ---
+openai-whisper>=20231117
+
+# --- Typing extensions (for Python 3.12 compat) ---
+typing-extensions>=4.9.0
