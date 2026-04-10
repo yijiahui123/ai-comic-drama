@@ -1,0 +1,31 @@
+# Service endpoints for the AI Comic Drama pipeline
+# Edit these values to match your local deployment.
+
+ollama:
+  url: "http://localhost:11434"
+  model: "llama3.1:70b-instruct-q4_K_M"
+  # Alternative: "qwen2.5:72b-q4_K_M"
+  timeout: 300  # seconds
+
+comfyui:
+  url: "http://localhost:8188"
+  timeout: 600  # seconds (video generation is slow)
+
+chattts:
+  url: "http://localhost:9966"
+  timeout: 60
+  enabled: true   # Set to false to skip voiceover
+
+sadtalker:
+  url: "http://localhost:7860"
+  timeout: 300
+  enabled: true   # Set to false to skip lip-sync
+
+# Output configuration
+output:
+  root: "output"
+  state_dir: "output/state"
+  videos_dir: "output/videos"
+  audio_dir: "output/audio"
+  lipsync_dir: "output/lipsync"
+  final_dir: "output/final"

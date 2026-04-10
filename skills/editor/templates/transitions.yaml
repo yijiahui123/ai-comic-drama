@@ -1,0 +1,30 @@
+# Transition effect configuration
+# These parameters are used to build FFmpeg xfade filter arguments.
+
+transitions:
+  crossfade:
+    filter: "xfade"
+    transition: "fade"
+    duration: 0.5      # seconds
+
+  fade_black:
+    filter: "xfade"
+    transition: "fadeblack"
+    duration: 0.8
+
+  cut:
+    filter: null       # Hard cut — no filter applied
+    duration: 0.0
+
+  dissolve:
+    filter: "xfade"
+    transition: "dissolve"
+    duration: 0.6
+
+  wipe_left:
+    filter: "xfade"
+    transition: "wipeleft"
+    duration: 0.5
+
+# Default transition used when a shot does not specify one
+default: "crossfade"

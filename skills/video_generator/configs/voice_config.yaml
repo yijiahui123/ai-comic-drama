@@ -1,0 +1,21 @@
+# ChatTTS voice configuration
+# speaker_map: maps character names to ChatTTS speaker IDs (integers 0–9)
+# Add entries for each character in your script.
+
+speaker_map:
+  "默认": 0          # Default / narrator voice
+  "女主角": 1        # Female protagonist
+  "男主角": 2        # Male protagonist
+  "反派": 3          # Villain
+  "配角A": 4         # Supporting character A
+  "配角B": 5         # Supporting character B
+
+# TTS generation settings
+speed: 1.0           # Speech speed multiplier (0.5–2.0)
+temperature: 0.3     # Sampling temperature (lower = more stable)
+top_p: 0.7           # Nucleus sampling probability
+top_k: 20            # Top-k sampling
+
+# Audio post-processing
+sample_rate: 24000   # Output sample rate (Hz)
+normalize: true      # Normalize audio amplitude
