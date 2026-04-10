@@ -23,6 +23,7 @@ from typing import Any, Optional
 
 import yaml
 
+from utils import slugify as _slugify
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -36,13 +37,6 @@ _ASSETS_SHOTS = Path("assets/shots")
 
 # Default FFmpeg subtitle burn-in filter
 _ASS_STYLE_TEMPLATE = _TEMPLATES_DIR / "subtitle_style.ass"
-
-
-def _slugify(text: str) -> str:
-    text = text.lower().strip()
-    text = re.sub(r"[^\w\s-]", "", text)
-    text = re.sub(r"[\s_]+", "-", text)
-    return text[:64]
 
 
 def _run_ffmpeg(args: list[str], description: str = "") -> bool:
@@ -267,7 +261,9 @@ class Editor:
             return None
 
         out = Path(tempfile.gettempdir()) / f"titled_ep{ep_num:02d}.mp4"
-        title_text = f"{title} — Episode {ep_num}"
+        # Escape single quotes and backslashes for FFmpeg drawtext
+        escaped_title = title.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
+        title_text = f"{escaped_title} — Episode {ep_num}"
 
         # Generate 3-second black title card with text
         title_clip = Path(tempfile.gettempdir()) / f"title_card_ep{ep_num:02d}.mp4"
@@ -319,9 +315,11 @@ class Editor:
             Path to the video with subtitles burned in, or ``None`` on failure.
         """
         out = Path(tempfile.gettempdir()) / f"subtitled_ep{ep_num:02d}.mp4"
+        # Escape the path for FFmpeg's ass filter (backslashes and colons)
+        escaped_ass = str(ass_path.resolve()).replace("\\", "/").replace(":", "\\:")
         args = [
             "-i", str(source),
-            "-vf", f"ass={ass_path}",
+            "-vf", f"ass={escaped_ass}",
             "-c:a", "copy",
             str(out),
         ]

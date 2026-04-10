@@ -21,7 +21,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import re
 import time
 import uuid
 from pathlib import Path
@@ -29,6 +28,7 @@ from typing import Any, Callable, Optional
 
 import aiohttp
 
+from utils import slugify as _slugify
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -62,21 +62,6 @@ def _load_workflow(filename: str) -> dict[str, Any]:
     """
     path = _WORKFLOWS_DIR / filename
     return json.loads(path.read_text(encoding="utf-8"))
-
-
-def _slugify(text: str) -> str:
-    """Convert *text* into a safe file-system-friendly slug.
-
-    Args:
-        text: Input string.
-
-    Returns:
-        Lower-cased, alphanumeric-and-hyphen-only slug.
-    """
-    text = text.lower().strip()
-    text = re.sub(r"[^\w\s-]", "", text)
-    text = re.sub(r"[\s_]+", "-", text)
-    return text[:64]
 
 
 class AssetGenerator:

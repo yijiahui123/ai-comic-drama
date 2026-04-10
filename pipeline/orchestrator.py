@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -183,7 +183,7 @@ class PipelineOrchestrator:
         """
         self.logger.info("=== Stage %s: STARTED ===", stage.value)
         self.state.current_stage = stage
-        result = StageResult(stage=stage, status="running", started_at=datetime.utcnow())
+        result = StageResult(stage=stage, status="running", started_at=datetime.now(timezone.utc))
         self.state.stages[stage.value] = result
         self.state.save()
 
@@ -192,7 +192,7 @@ class PipelineOrchestrator:
             output = await coro_fn(**kwargs)
             elapsed = time.monotonic() - t0
             result.status = "done"
-            result.completed_at = datetime.utcnow()
+            result.completed_at = datetime.now(timezone.utc)
             result.elapsed_seconds = elapsed
             result.output_summary = str(output)[:200] if output is not None else None
             self.logger.info(
@@ -203,7 +203,7 @@ class PipelineOrchestrator:
         except Exception as exc:  # noqa: BLE001
             elapsed = time.monotonic() - t0
             result.status = "error"
-            result.completed_at = datetime.utcnow()
+            result.completed_at = datetime.now(timezone.utc)
             result.elapsed_seconds = elapsed
             result.error = str(exc)
             self.state.current_stage = Stage.ERROR

@@ -12,6 +12,7 @@ in ``utils/validators.py``.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from pathlib import Path
@@ -171,7 +172,6 @@ class ScriptWriter:
         Raises:
             RuntimeError: After all retries are exhausted.
         """
-        import asyncio  # noqa: PLC0415
 
         payload = {
             "model": self.model,

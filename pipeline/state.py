@@ -7,7 +7,7 @@ the pipeline can resume after an interruption.
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
@@ -74,8 +74,8 @@ class PipelineState(BaseModel):
     asset_manifest: dict[str, list[str]] = Field(default_factory=dict)
     video_manifest: dict[str, list[str]] = Field(default_factory=dict)
     final_video: Optional[str] = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     # ------------------------------------------------------------------
     # Helpers
@@ -111,7 +111,7 @@ class PipelineState(BaseModel):
         """
         state_dir.mkdir(parents=True, exist_ok=True)
         path = state_dir / f"{self.project_id}.json"
-        self.updated_at = datetime.utcnow()
+        self.updated_at = datetime.now(timezone.utc)
         path.write_text(
             self.model_dump_json(indent=2),
             encoding="utf-8",

@@ -31,6 +31,7 @@ from typing import Any, Optional
 import aiohttp
 import yaml
 
+from utils import slugify as _slugify
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -169,8 +170,6 @@ class VideoGenerator:
     @staticmethod
     def _iter_shots(script: dict[str, Any]):
         """Yield ``(shot, shot_image_path)`` tuples for every shot in *script*."""
-        from skills.asset_generator.skill import _slugify  # noqa: PLC0415
-
         for episode in script.get("episodes", []):
             for scene in episode.get("scenes", []):
                 for shot in scene.get("shots", []):
