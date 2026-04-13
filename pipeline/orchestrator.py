@@ -10,6 +10,7 @@ successfully completed stage.
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from datetime import datetime, timezone
@@ -24,6 +25,7 @@ from skills.asset_generator.skill import AssetGenerator
 from skills.video_generator.skill import VideoGenerator
 from skills.editor.skill import Editor
 from utils.logger import get_pipeline_logger
+from utils.model_unloader import force_gc, unload_comfyui_models, unload_ollama_model
 
 
 _CONFIGS_DIR = Path("configs")
@@ -109,42 +111,76 @@ class PipelineOrchestrator:
         self.state.save()
 
         svc = self._services
+        mem_cfg = svc.get("memory", {})
+        unload_enabled: bool = mem_cfg.get("unload_between_stages", True)
+        gc_delay: float = float(mem_cfg.get("gc_delay", 2))
+
+        ollama_url: str = svc.get("ollama", {}).get("url", "http://localhost:11434")
+        ollama_model: str = svc.get("ollama", {}).get("model", "llama3.1:70b-instruct-q4_K_M")
+        comfyui_url: str = svc.get("comfyui", {}).get("url", "http://localhost:8188")
 
         # --- Stage: SCRIPTING ---
         if not self.state.is_stage_done(Stage.SCRIPTING):
             script = await self._run_stage(
                 Stage.SCRIPTING,
                 self._do_scripting,
-                ollama_url=svc.get("ollama", {}).get("url", "http://localhost:11434"),
-                model=svc.get("ollama", {}).get("model", "llama3.1:70b-instruct-q4_K_M"),
+                ollama_url=ollama_url,
+                model=ollama_model,
             )
             if script is None:
                 return self.state
             self.state.script = script
+
+        # Unload Ollama LLM after scripting to free memory before asset generation
+        if unload_enabled:
+            try:
+                await unload_ollama_model(ollama_url, ollama_model)
+                force_gc()
+                await asyncio.sleep(gc_delay)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("Memory unload after SCRIPTING failed (non-fatal): %s", exc)
 
         # --- Stage: ASSET_GEN ---
         if not self.state.is_stage_done(Stage.ASSET_GEN):
             manifest = await self._run_stage(
                 Stage.ASSET_GEN,
                 self._do_asset_gen,
-                comfyui_url=svc.get("comfyui", {}).get("url", "http://localhost:8188"),
+                comfyui_url=comfyui_url,
             )
             if manifest is None:
                 return self.state
             self.state.asset_manifest = {k: [str(p) for p in v] for k, v in manifest.items()}
+
+        # Unload ComfyUI SDXL models after asset generation
+        if unload_enabled:
+            try:
+                await unload_comfyui_models(comfyui_url)
+                force_gc()
+                await asyncio.sleep(gc_delay)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("Memory unload after ASSET_GEN failed (non-fatal): %s", exc)
 
         # --- Stage: VIDEO_GEN ---
         if not self.state.is_stage_done(Stage.VIDEO_GEN):
             manifest = await self._run_stage(
                 Stage.VIDEO_GEN,
                 self._do_video_gen,
-                comfyui_url=svc.get("comfyui", {}).get("url", "http://localhost:8188"),
+                comfyui_url=comfyui_url,
                 chattts_url=svc.get("chattts", {}).get("url", "http://localhost:9966"),
                 sadtalker_url=svc.get("sadtalker", {}).get("url", "http://localhost:7860"),
             )
             if manifest is None:
                 return self.state
             self.state.video_manifest = {k: [str(p) for p in v] for k, v in manifest.items()}
+
+        # Unload ComfyUI Wan2.1 models after video generation
+        if unload_enabled:
+            try:
+                await unload_comfyui_models(comfyui_url)
+                force_gc()
+                await asyncio.sleep(gc_delay)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("Memory unload after VIDEO_GEN failed (non-fatal): %s", exc)
 
         # --- Stage: EDITING ---
         if not self.state.is_stage_done(Stage.EDITING):

@@ -21,6 +21,11 @@ sadtalker:
   timeout: 300
   enabled: true   # Set to false to skip lip-sync
 
+# Memory management — release models between pipeline stages to avoid OOM
+memory:
+  unload_between_stages: true   # Set to false to skip unloading (useful for debugging)
+  gc_delay: 2                   # Seconds to wait after unloading before starting next stage
+
 # Output configuration
 output:
   root: "output"
