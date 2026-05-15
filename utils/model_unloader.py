@@ -1,14 +1,18 @@
 """Model unloading utilities for inter-stage memory management.
 
-Provides async helpers to release GPU/unified-memory held by Ollama and
-ComfyUI between pipeline stages.  All operations are *best-effort*: failures
-are logged as warnings so they never interrupt the pipeline.
+Provides async helpers to release GPU/unified-memory held by oMLX, ComfyUI,
+ChatTTS, and SadTalker between pipeline stages.  All operations are
+*best-effort*: failures are logged as warnings so they never interrupt
+the pipeline.
 """
 
 from __future__ import annotations
 
 import asyncio
 import gc
+import os
+import signal
+import subprocess
 from typing import Optional
 
 import aiohttp
@@ -16,34 +20,52 @@ import aiohttp
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
-
 _UNLOAD_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
 
 
-async def unload_ollama_model(ollama_url: str, model_name: str) -> None:
-    """Ask Ollama to evict *model_name* from memory.
+async def kill_omlx_server() -> None:
+    """Kill the oMLX server process to free LLM memory (~20-25GB).
 
-    Sends ``POST /api/generate`` with ``keep_alive=0``, which instructs
-    Ollama to immediately unload the model rather than keeping it warm.
+    oMLX is only used in the SCRIPTING stage.  After that, killing the
+    process is the most reliable way to reclaim memory on macOS, since
+    oMLX doesn't expose an explicit model-unload API.
 
-    Args:
-        ollama_url: Base URL of the Ollama service (e.g. ``http://localhost:11434``).
-        model_name: Exact model tag as returned by ``ollama list``
-            (e.g. ``llama3.1:70b-instruct-q4_K_M``).
+    Finds the process by name and sends SIGTERM, then SIGKILL if needed.
     """
-    logger.info("🧹 Unloading Ollama model '%s'…", model_name)
-    url = f"{ollama_url.rstrip('/')}/api/generate"
-    payload = {"model": model_name, "keep_alive": 0}
-
+    logger.info("🧹 Killing oMLX server process to free LLM memory…")
     try:
-        async with aiohttp.ClientSession(timeout=_UNLOAD_TIMEOUT) as session:
-            async with session.post(url, json=payload) as resp:
-                resp.raise_for_status()
-        logger.info("✅ Ollama model '%s' unloaded successfully.", model_name)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "⚠️  Could not unload Ollama model '%s' (non-fatal): %s", model_name, exc
+        # Find oMLX processes (exclude our own PID)
+        result = subprocess.run(
+            ["pgrep", "-f", "omlx"],
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
+        pids = [int(pid) for pid in result.stdout.strip().split("\n") if pid.strip()]
+
+        if not pids:
+            logger.info("ℹ️  No oMLX process found (already stopped?).")
+            return
+
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                logger.info("  → Sent SIGTERM to oMLX process %d", pid)
+            except ProcessLookupError:
+                pass
+
+        # Wait briefly for graceful shutdown, then force kill
+        await asyncio.sleep(2)
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                logger.info("  → Sent SIGKILL to oMLX process %d", pid)
+            except ProcessLookupError:
+                pass
+
+        logger.info("✅ oMLX server killed. ~20-25GB memory freed.")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("⚠️  Could not kill oMLX server (non-fatal): %s", exc)
 
 
 async def unload_comfyui_models(comfyui_url: str) -> None:

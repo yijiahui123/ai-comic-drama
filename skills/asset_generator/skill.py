@@ -29,6 +29,18 @@ from typing import Any, Callable, Optional
 import aiohttp
 
 from utils import slugify as _slugify
+from utils.assets import (
+    EXPRESSION_VARIANTS,
+    AssetLibrary,
+    canonical_character_expression,
+    canonical_character_reference,
+    canonical_scene,
+    canonical_shot,
+    copy_asset_to_canonical,
+    load_asset_config,
+    load_asset_manifest,
+    normalize_shot_emotion,
+)
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -40,6 +52,7 @@ _WORKFLOWS_DIR = Path(__file__).parent / "workflows"
 _COMFYUI_PROMPT_PATH = "/prompt"
 _COMFYUI_HISTORY_PATH = "/history/{prompt_id}"
 _COMFYUI_VIEW_PATH = "/view"
+_COMFYUI_UPLOAD_PATH = "/upload/image"
 
 # Polling configuration
 _POLL_INTERVAL = 3.0   # seconds
@@ -47,8 +60,6 @@ _POLL_TIMEOUT = 600.0  # seconds (10 min)
 
 # Assets root
 _ASSETS_ROOT = Path("assets")
-
-EXPRESSION_VARIANTS = ["neutral", "happy", "surprised", "angry", "sad"]
 
 
 def _load_workflow(filename: str) -> dict[str, Any]:
@@ -89,6 +100,14 @@ class AssetGenerator:
         self.assets_root = Path(assets_root)
         self._progress_callback = progress_callback
         self._session: Optional[aiohttp.ClientSession] = None
+        self._asset_config = load_asset_config()
+        self._library = AssetLibrary(load_asset_manifest(), self._asset_config)
+        self.asset_sources: dict[str, dict[str, str]] = {
+            "characters": {},
+            "expressions": {},
+            "scenes": {},
+            "shots": {},
+        }
 
     # ------------------------------------------------------------------
     # Session lifecycle
@@ -136,13 +155,23 @@ class AssetGenerator:
         scene_stubs = self._extract_scenes(script)
         shots = self._extract_shots(script)
 
+        # Build character design card lookup: name → flux_prompt
+        char_cards = {
+            c["name"]: c
+            for c in script.get("characters", [])
+            if isinstance(c, dict) and "name" in c
+        }
+
         total = len(characters) * (1 + len(EXPRESSION_VARIANTS)) + len(scene_stubs) + len(shots)
         current = 0
 
         # ---- Characters ----
         char_paths: list[Path] = []
         for char_name in characters:
-            paths = await self._generate_character(char_name, script.get("style", "anime"))
+            card = char_cards.get(char_name)
+            paths = await self._generate_character(
+                char_name, script.get("style", "anime"), card,
+            )
             char_paths.extend(paths)
             current += 1 + len(EXPRESSION_VARIANTS)
             self._report(f"Character '{char_name}' generated", current, total)
@@ -159,7 +188,7 @@ class AssetGenerator:
         # ---- Shots ----
         shot_paths: list[Path] = []
         for shot in shots:
-            path = await self._generate_shot(shot)
+            path = await self._generate_shot(shot, char_cards)
             if path:
                 shot_paths.append(path)
             current += 1
@@ -222,12 +251,25 @@ class AssetGenerator:
     # Generation methods
     # ------------------------------------------------------------------
 
-    async def _generate_character(self, char_name: str, style: str) -> list[Path]:
+    async def _generate_character(
+        self,
+        char_name: str,
+        style: str,
+        card: Optional[dict[str, Any]] = None,
+    ) -> list[Path]:
         """Generate reference sheet + expression variants for *char_name*.
+
+        Uses ``character_gen.json`` (pure text-to-image) for the reference sheet
+        and ``character_expression.json`` (Flux.2 + ReferenceLatent) for
+        expression variants so the character appearance stays consistent.
+
+        When a character design card (from ScriptWriter) is provided, its
+        ``flux_prompt`` field is used as the base prompt for better consistency.
 
         Args:
             char_name: Character name.
             style: Visual style description.
+            card: Optional character design card dict with ``flux_prompt``.
 
         Returns:
             List of saved image paths.
@@ -237,38 +279,84 @@ class AssetGenerator:
 
         paths: list[Path] = []
 
-        # Reference image
-        ref_path = char_dir / "reference.png"
+        # Reference image (pure text-to-image)
+        ref_path = canonical_character_reference(char_name, self.assets_root)
+        library_ref = self._library.character_reference(char_name)
+        if library_ref:
+            copy_asset_to_canonical(library_ref, ref_path)
+            self.asset_sources["characters"][str(ref_path)] = "library"
         if not ref_path.exists():
-            prompt = (
-                f"Character design sheet for '{char_name}', {style}, "
-                "front view, full body, white background, detailed anime character design, "
-                "high quality illustration"
-            )
+            if card and card.get("flux_prompt"):
+                # Use character design card prompt for consistency
+                prompt = (
+                    f"Character design sheet for '{char_name}', "
+                    f"{card['flux_prompt']}, "
+                    f"front view, full body, white background, {style}"
+                )
+            else:
+                prompt = (
+                    f"Character design sheet for '{char_name}', {style}, "
+                    "front view, full body, white background, detailed anime character design, "
+                    "high quality illustration"
+                )
             workflow = _load_workflow("character_gen.json")
             workflow = self._inject_prompt(workflow, prompt)
+            workflow = self._inject_loras(workflow, [self._library.style_lora(), self._library.character_lora(char_name)])
             image_bytes = await self._run_workflow(workflow)
             if image_bytes:
                 ref_path.write_bytes(image_bytes)
                 logger.info("Saved character reference: %s", ref_path)
+                self.asset_sources["characters"][str(ref_path)] = "generated"
+        else:
+            self.asset_sources["characters"].setdefault(str(ref_path), "canonical")
         paths.append(ref_path)
 
-        # Expression variants
+        # Upload reference image to ComfyUI for use as ReferenceLatent source
+        ref_comfyui_name: Optional[str] = None
+        if ref_path.exists():
+            ref_comfyui_name = await self._upload_image(ref_path)
+            if not ref_comfyui_name:
+                logger.warning(
+                    "Failed to upload reference image for '%s' — "
+                    "expression variants will use pure text-to-image fallback",
+                    char_name,
+                )
+
+        # Expression variants (ReferenceLatent when possible, fallback to pure t2i)
         expr_dir = char_dir / "expressions"
         expr_dir.mkdir(exist_ok=True)
         for expression in EXPRESSION_VARIANTS:
-            expr_path = expr_dir / f"{expression}.png"
+            expr_path = canonical_character_expression(char_name, expression, self.assets_root)
+            library_expr = self._library.character_expression(char_name, expression)
+            if library_expr:
+                copy_asset_to_canonical(library_expr, expr_path)
+                self.asset_sources["expressions"][str(expr_path)] = "library"
             if not expr_path.exists():
-                prompt = (
-                    f"Close-up portrait of '{char_name}', {expression} expression, "
-                    f"{style}, detailed face, white background, high quality anime art"
-                )
-                workflow = _load_workflow("character_gen.json")
-                workflow = self._inject_prompt(workflow, prompt)
+                if card and card.get("flux_prompt"):
+                    prompt = (
+                        f"Close-up portrait of '{char_name}', {expression} expression, "
+                        f"{card['flux_prompt']}, detailed face, white background, {style}"
+                    )
+                else:
+                    prompt = (
+                        f"Close-up portrait of '{char_name}', {expression} expression, "
+                        f"{style}, detailed face, white background, high quality anime art"
+                    )
+                if ref_comfyui_name:
+                    workflow = _load_workflow("character_expression.json")
+                    workflow = self._inject_prompt(workflow, prompt)
+                    workflow = self._inject_reference_image(workflow, ref_comfyui_name)
+                else:
+                    workflow = _load_workflow("character_gen.json")
+                    workflow = self._inject_prompt(workflow, prompt)
+                workflow = self._inject_loras(workflow, [self._library.style_lora(), self._library.character_lora(char_name)])
                 image_bytes = await self._run_workflow(workflow)
                 if image_bytes:
                     expr_path.write_bytes(image_bytes)
                     logger.debug("Saved expression variant: %s", expr_path)
+                    self.asset_sources["expressions"][str(expr_path)] = "generated"
+            else:
+                self.asset_sources["expressions"].setdefault(str(expr_path), "canonical")
             paths.append(expr_path)
 
         return paths
@@ -285,9 +373,14 @@ class AssetGenerator:
         """
         scene_dir = self.assets_root / "scenes"
         scene_dir.mkdir(parents=True, exist_ok=True)
-        out_path = scene_dir / f"{_slugify(scene['scene_id'])}.png"
+        out_path = canonical_scene(scene["scene_id"], self.assets_root)
+        library_scene = self._library.scene(scene["scene_id"])
+        if library_scene:
+            copy_asset_to_canonical(library_scene, out_path)
+            self.asset_sources["scenes"][str(out_path)] = "library"
 
         if out_path.exists():
+            self.asset_sources["scenes"].setdefault(str(out_path), "canonical")
             return out_path
 
         location = scene.get("location", "unknown location")
@@ -300,15 +393,21 @@ class AssetGenerator:
         )
         workflow = _load_workflow("scene_gen.json")
         workflow = self._inject_prompt(workflow, prompt)
+        workflow = self._inject_loras(workflow, [self._library.style_lora()])
         image_bytes = await self._run_workflow(workflow)
         if image_bytes:
             out_path.write_bytes(image_bytes)
             logger.info("Saved scene background: %s", out_path)
+            self.asset_sources["scenes"][str(out_path)] = "generated"
             return out_path
 
         return None
 
-    async def _generate_shot(self, shot: dict[str, Any]) -> Optional[Path]:
+    async def _generate_shot(
+        self,
+        shot: dict[str, Any],
+        char_cards: Optional[dict[str, dict[str, Any]]] = None,
+    ) -> Optional[Path]:
         """Generate the storyboard image for *shot*.
 
         Args:
@@ -319,9 +418,14 @@ class AssetGenerator:
         """
         shots_dir = self.assets_root / "shots"
         shots_dir.mkdir(parents=True, exist_ok=True)
-        out_path = shots_dir / f"{_slugify(shot['shot_id'])}.png"
+        out_path = canonical_shot(shot["shot_id"], self.assets_root)
+        library_shot = self._library.shot(shot["shot_id"])
+        if library_shot:
+            copy_asset_to_canonical(library_shot, out_path)
+            self.asset_sources["shots"][str(out_path)] = "library"
 
         if out_path.exists():
+            self.asset_sources["shots"].setdefault(str(out_path), "canonical")
             return out_path
 
         visual_prompt = shot.get("visual_prompt", "")
@@ -329,14 +433,63 @@ class AssetGenerator:
             logger.warning("Shot %s has no visual_prompt — skipping", shot.get("shot_id"))
             return None
 
-        workflow = _load_workflow("shot_gen.json")
-        workflow = self._inject_prompt(workflow, visual_prompt)
+        prompt = self._enrich_shot_prompt(shot, visual_prompt, char_cards or {})
+        reference_image = await self._select_shot_reference_image(shot)
+        workflow = _load_workflow("shot_gen.json" if reference_image else "shot_gen_text.json")
+        workflow = self._inject_prompt(workflow, prompt)
+        if reference_image:
+            uploaded_ref = await self._upload_image(reference_image)
+            if uploaded_ref:
+                workflow = self._inject_reference_image(workflow, uploaded_ref)
+        loras = [self._library.style_lora()]
+        for character in shot.get("characters", []):
+            loras.append(self._library.character_lora(character))
+        workflow = self._inject_loras(workflow, loras)
         image_bytes = await self._run_workflow(workflow)
         if image_bytes:
             out_path.write_bytes(image_bytes)
             logger.info("Saved shot image: %s", out_path)
+            self.asset_sources["shots"][str(out_path)] = "generated"
             return out_path
 
+        return None
+
+    def _enrich_shot_prompt(
+        self,
+        shot: dict[str, Any],
+        visual_prompt: str,
+        char_cards: dict[str, dict[str, Any]],
+    ) -> str:
+        triggers: list[str] = []
+        descriptions: list[str] = []
+        for character in shot.get("characters", []):
+            lora = self._library.character_lora(character)
+            if lora and lora.get("trigger"):
+                triggers.append(str(lora["trigger"]))
+            card = char_cards.get(character, {})
+            if card.get("flux_prompt") and card["flux_prompt"] not in visual_prompt:
+                descriptions.append(str(card["flux_prompt"]))
+        prefix = ", ".join([*triggers, *descriptions])
+        emotion = normalize_shot_emotion(shot)
+        if prefix:
+            return f"{prefix}, {emotion} expression, {visual_prompt}"
+        return f"{emotion} expression, {visual_prompt}"
+
+    async def _select_shot_reference_image(self, shot: dict[str, Any]) -> Optional[Path]:
+        refs = self._asset_config.get("references", {})
+        characters = [c for c in shot.get("characters", []) if c]
+        if not characters:
+            return None
+        character = characters[0]
+        emotion = normalize_shot_emotion(shot)
+        if refs.get("use_expression_reference_for_shots", True):
+            expr = canonical_character_expression(character, emotion, self.assets_root)
+            if expr.exists():
+                return expr
+        if refs.get("use_character_reference_for_shots", True):
+            ref = canonical_character_reference(character, self.assets_root)
+            if ref.exists():
+                return ref
         return None
 
     # ------------------------------------------------------------------
@@ -357,12 +510,110 @@ class AssetGenerator:
         Returns:
             The modified workflow dictionary.
         """
-        for node in workflow.values():
+        original_nodes = list(workflow.values())
+        for node in original_nodes:
             if isinstance(node, dict):
                 inputs = node.get("inputs", {})
                 if "__PROMPT_PLACEHOLDER__" in inputs.get("text", ""):
                     inputs["text"] = prompt_text
         return workflow
+
+    @staticmethod
+    def _inject_reference_image(workflow: dict[str, Any], image_filename: str) -> dict[str, Any]:
+        """Replace ``__REF_IMAGE_PLACEHOLDER__`` in *workflow* with *image_filename*.
+
+        The placeholder is expected to appear as the ``image`` input inside a
+        ``LoadImage`` node in the workflow.
+
+        Args:
+            workflow: ComfyUI workflow dictionary (modified in-place).
+            image_filename: The ComfyUI-side filename of the uploaded reference image.
+
+        Returns:
+            The modified workflow dictionary.
+        """
+        for node in workflow.values():
+            if isinstance(node, dict):
+                inputs = node.get("inputs", {})
+                if inputs.get("image") == "__REF_IMAGE_PLACEHOLDER__":
+                    inputs["image"] = image_filename
+        return workflow
+
+    @staticmethod
+    def _inject_loras(
+        workflow: dict[str, Any],
+        loras: list[Optional[dict[str, Any]]],
+    ) -> dict[str, Any]:
+        """Inject optional LoRA nodes between model loaders and guider nodes."""
+        active = [lora for lora in loras if lora and lora.get("name")]
+        if not active:
+            return workflow
+
+        model_node_id: Optional[str] = None
+        for node_id, node in workflow.items():
+            if isinstance(node, dict) and node.get("class_type") == "UNETLoader":
+                model_node_id = node_id
+                break
+        if model_node_id is None:
+            return workflow
+
+        current_model: list[Any] = [model_node_id, 0]
+        next_id = max((int(k) for k in workflow.keys() if str(k).isdigit()), default=0) + 1
+        for lora in active:
+            node_id = str(next_id)
+            next_id += 1
+            workflow[node_id] = {
+                "class_type": "LoraLoaderModelOnly",
+                "inputs": {
+                    "model": current_model,
+                    "lora_name": lora["name"],
+                    "strength_model": float(lora.get("strength_model", 0.7)),
+                },
+            }
+            current_model = [node_id, 0]
+
+        original_nodes = [
+            node
+            for node in workflow.values()
+            if isinstance(node, dict)
+            and node.get("class_type") != "LoraLoaderModelOnly"
+        ]
+        for node in original_nodes:
+            if not isinstance(node, dict):
+                continue
+            inputs = node.get("inputs", {})
+            if inputs.get("model") == [model_node_id, 0]:
+                inputs["model"] = current_model
+        return workflow
+
+    async def _upload_image(self, image_path: Path) -> Optional[str]:
+        """Upload a local image to ComfyUI's ``/upload/image`` endpoint.
+
+        Args:
+            image_path: Path to the local image file.
+
+        Returns:
+            The filename assigned by ComfyUI, or ``None`` on failure.
+        """
+        session = self._get_session()
+        try:
+            data = aiohttp.FormData()
+            data.add_field(
+                "image",
+                open(image_path, "rb"),
+                filename=image_path.name,
+                content_type="image/png",
+            )
+            async with session.post(
+                f"{self.comfyui_url}{_COMFYUI_UPLOAD_PATH}",
+                data=data,
+            ) as resp:
+                resp.raise_for_status()
+                result = await resp.json()
+                return result.get("name")
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to upload image %s: %s", image_path, exc)
+            return None
 
     async def _run_workflow(self, workflow: dict[str, Any]) -> Optional[bytes]:
         """Submit *workflow* to ComfyUI and poll until the image is ready.

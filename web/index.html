@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AI Comic Drama Console</title>
+    <link rel="stylesheet" href="/web/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <div>
+          <p class="eyebrow">AI Comic Drama</p>
+          <h1>漫剧生成控制台</h1>
+          <p class="sub">输入剧情，监控生成阶段，预览资产和最终视频。</p>
+        </div>
+        <button id="validateAssets" class="secondary">检查资源配置</button>
+      </section>
+
+      <section class="panel create">
+        <textarea id="prompt" placeholder="写一个 1 集赛博朋克漫剧，主角是黑客少女..."></textarea>
+        <button id="start">开始生成</button>
+      </section>
+
+      <section class="grid">
+        <aside class="panel">
+          <div class="section-head">
+            <h2>项目</h2>
+            <button id="refresh" class="ghost">刷新</button>
+          </div>
+          <div id="projects" class="project-list"></div>
+        </aside>
+
+        <section class="panel detail">
+          <div class="section-head">
+            <h2 id="projectTitle">未选择项目</h2>
+            <div class="actions">
+              <button data-rerun="ASSET_GEN" class="ghost rerun">重跑资产</button>
+              <button data-rerun="VIDEO_GEN" class="ghost rerun">重跑视频</button>
+              <button id="resume" class="ghost">恢复</button>
+            </div>
+          </div>
+          <div id="status" class="status"></div>
+          <div class="progress"><span id="progressBar"></span></div>
+          <pre id="log"></pre>
+          <div id="assetsResult" class="notice"></div>
+        </section>
+      </section>
+
+      <section class="panel">
+        <h2>预览</h2>
+        <div id="preview" class="preview"></div>
+      </section>
+
+      <section class="panel library">
+        <div class="section-head">
+          <div>
+            <h2>资源库</h2>
+            <p class="sub">上传角色/表情/场景/分镜资源，或直接编辑 manifest 与资产配置。</p>
+          </div>
+          <button id="loadAssets" class="ghost">载入资源库</button>
+        </div>
+
+        <div class="library-grid">
+          <form id="uploadForm" class="asset-form">
+            <label>
+              类型
+              <select id="assetType">
+                <option value="character_reference">角色参考图</option>
+                <option value="character_expression">角色表情图</option>
+                <option value="scene">场景图</option>
+                <option value="shot">分镜图</option>
+              </select>
+            </label>
+            <label>
+              Key（角色名 / scene_id / shot_id）
+              <input id="assetKey" placeholder="凯 或 S01E01 或 S01E01-001" />
+            </label>
+            <label>
+              表情（仅角色表情图）
+              <select id="assetEmotion">
+                <option value="neutral">neutral</option>
+                <option value="happy">happy</option>
+                <option value="sad">sad</option>
+                <option value="angry">angry</option>
+                <option value="surprised">surprised</option>
+              </select>
+            </label>
+            <label>
+              图片文件
+              <input id="assetFile" type="file" accept=".png,.jpg,.jpeg,.webp,image/*" />
+            </label>
+            <button type="submit">上传并写入 manifest</button>
+          </form>
+
+          <form id="loraForm" class="asset-form">
+            <h3>角色 LoRA（可选）</h3>
+            <label>
+              角色名
+              <input id="loraCharacter" placeholder="凯" />
+            </label>
+            <label class="check">
+              <input id="loraEnabled" type="checkbox" />
+              启用该角色 LoRA
+            </label>
+            <label>
+              LoRA 文件名
+              <input id="loraName" placeholder="kai_v1.safetensors" />
+            </label>
+            <label>
+              Trigger
+              <input id="loraTrigger" placeholder="kai_person" />
+            </label>
+            <button type="submit">保存 LoRA 映射</button>
+          </form>
+        </div>
+
+        <div class="yaml-grid">
+          <label>
+            manifest.yaml
+            <textarea id="manifestYaml" class="yaml"></textarea>
+          </label>
+          <label>
+            configs/assets.yaml
+            <textarea id="configYaml" class="yaml"></textarea>
+          </label>
+        </div>
+        <div class="actions">
+          <button id="saveManifest" class="secondary">保存 manifest</button>
+          <button id="saveConfig" class="secondary">保存配置</button>
+        </div>
+      </section>
+    </main>
+    <script src="/web/app.js"></script>
+  </body>
+</html>

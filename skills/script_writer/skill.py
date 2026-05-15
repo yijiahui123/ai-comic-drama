@@ -1,7 +1,7 @@
 """ScriptWriter Skill.
 
-Calls the Ollama HTTP API to produce a structured JSON script from a natural-language
-user description.  Generation is split into two phases:
+Calls an OpenAI-compatible LLM API (oMLX) to produce a structured JSON script
+from a natural-language user description.  Generation is split into two phases:
 
 1. **Outline phase** – produce a high-level story outline (episodes, scenes).
 2. **Scene expansion phase** – expand each scene into detailed shot descriptions.
@@ -16,7 +16,7 @@ import asyncio
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import aiohttp
 
@@ -28,8 +28,8 @@ logger = get_logger(__name__)
 # Directory containing system prompt templates
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
 
-# Ollama endpoint paths
-_OLLAMA_CHAT_PATH = "/api/chat"
+# OpenAI-compatible endpoint path
+_CHAT_COMPLETIONS_PATH = "/chat/completions"
 
 # Retry configuration
 _MAX_RETRIES = 3
@@ -83,25 +83,28 @@ def _extract_json(text: str) -> dict[str, Any]:
 
 
 class ScriptWriter:
-    """Generates structured comic-drama scripts using an Ollama-hosted LLM.
+    """Generates structured comic-drama scripts using an OpenAI-compatible LLM.
 
     Attributes:
-        ollama_url: Base URL of the Ollama service.
-        model: Ollama model identifier.
+        base_url: Base URL of the LLM API (e.g. oMLX at ``http://127.0.0.1:8000/v1``).
+        model: Model identifier.
     """
 
     def __init__(
         self,
-        ollama_url: str = "http://localhost:11434",
-        model: str = "llama3.1:70b-instruct-q4_K_M",
+        base_url: str = "http://127.0.0.1:8000/v1",
+        model: str = "Qwen3.6-35B-A3B-MLX-8bit",
+        api_key: Optional[str] = None,
     ) -> None:
         """
         Args:
-            ollama_url: Base URL of the Ollama API server.
-            model: Model name as registered in Ollama (e.g. ``qwen2.5:72b-q4_K_M``).
+            base_url: Base URL of the OpenAI-compatible API server.
+            model: Model name as registered in the API server.
+            api_key: Optional API key for authentication.
         """
-        self.ollama_url = ollama_url.rstrip("/")
+        self.base_url = base_url.rstrip("/")
         self.model = model
+        self._api_key = api_key
         self._outline_prompt = _load_prompt("system_outline.txt")
         self._scene_prompt = _load_prompt("system_scene.txt")
 
@@ -159,7 +162,7 @@ class ScriptWriter:
         user_message: str,
         temperature: float = 0.7,
     ) -> str:
-        """Send a chat request to Ollama and return the assistant's reply.
+        """Send a chat request to the LLM API and return the assistant's reply.
 
         Args:
             system_prompt: System-level instruction.
@@ -172,36 +175,39 @@ class ScriptWriter:
         Raises:
             RuntimeError: After all retries are exhausted.
         """
-
         payload = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},
             ],
-            "stream": False,
-            "options": {"temperature": temperature},
+            "temperature": temperature,
         }
 
         last_exc: Exception = RuntimeError("No attempts made")
         delay = _RETRY_DELAY
         timeout = aiohttp.ClientTimeout(total=300, connect=10)
 
+        headers: dict[str, str] = {}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+
         for attempt in range(1, _MAX_RETRIES + 2):
             try:
                 async with aiohttp.ClientSession(timeout=timeout) as session:
                     async with session.post(
-                        f"{self.ollama_url}{_OLLAMA_CHAT_PATH}",
+                        f"{self.base_url}{_CHAT_COMPLETIONS_PATH}",
                         json=payload,
+                        headers=headers,
                     ) as resp:
                         resp.raise_for_status()
                         data = await resp.json()
-                        return data["message"]["content"]
-            except (aiohttp.ClientError, asyncio.TimeoutError, KeyError) as exc:
+                        return data["choices"][0]["message"]["content"]
+            except (aiohttp.ClientError, asyncio.TimeoutError, KeyError, IndexError) as exc:
                 last_exc = exc
                 if attempt <= _MAX_RETRIES:
                     logger.warning(
-                        "Ollama request failed (attempt %d/%d): %s — retrying in %.1fs",
+                        "LLM request failed (attempt %d/%d): %s — retrying in %.1fs",
                         attempt,
                         _MAX_RETRIES + 1,
                         exc,
@@ -210,7 +216,7 @@ class ScriptWriter:
                     await asyncio.sleep(delay)
                     delay *= 2
 
-        raise RuntimeError(f"Ollama unreachable after {_MAX_RETRIES + 1} attempts: {last_exc}") from last_exc
+        raise RuntimeError(f"LLM unreachable after {_MAX_RETRIES + 1} attempts: {last_exc}") from last_exc
 
     async def _generate_outline(self, user_description: str) -> dict[str, Any]:
         """Phase 1: generate a high-level story outline.
@@ -291,6 +297,10 @@ class ScriptWriter:
         if "style" not in script:
             script["style"] = "anime"
 
+        # Ensure character design cards exist
+        if "characters" not in script:
+            script["characters"] = []
+
         for episode in script.get("episodes", []):
             for scene in episode.get("scenes", []):
                 scene.setdefault("location", "未知场景")
@@ -298,13 +308,20 @@ class ScriptWriter:
                     shot.setdefault("type", "中景")
                     shot.setdefault("characters", [])
                     shot.setdefault("dialogue", "")
-                    shot.setdefault("camera_move", "固定")
+                    shot.setdefault("camera_move", "static")
                     shot.setdefault("duration", 4)
                     shot.setdefault("mood", "neutral")
                     if not shot.get("visual_prompt"):
                         shot["visual_prompt"] = (
                             f"{shot.get('type', 'medium shot')}, anime style, "
-                            f"{scene.get('location', 'interior')}"
+                            f"{scene.get('location', 'interior')}, "
+                            f"clean edges, cinematic still, 16:9 aspect ratio, "
+                            f"photorealistic dark fantasy, consistent lighting"
+                        )
+                    if not shot.get("motion_prompt"):
+                        shot["motion_prompt"] = (
+                            f"Subtle camera movement, gentle breathing motion, "
+                            f"natural environmental details"
                         )
 
         return script

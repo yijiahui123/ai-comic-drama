@@ -2,8 +2,7 @@
 
 Usage::
 
-    # 确保 Ollama 正在运行
-    ollama serve
+    # 确保 oMLX 正在运行 (http://127.0.0.1:8000)
 
     # 运行测试
     python tests/test_script_writer.py
@@ -20,10 +19,9 @@ from skills.script_writer.skill import ScriptWriter
 
 
 async def test():
-    # 如果用小模型先测试，改成你实际 pull 的模型名
     writer = ScriptWriter(
-        ollama_url="http://localhost:11434",
-        model="qwen2.5:14b",  # 正式用: llama3.1:70b-instruct-q4_K_M
+        base_url="http://127.0.0.1:8000/v1",
+        model="Qwen3.6-35B-A3B-MLX-8bit",
     )
 
     prompt = (

@@ -1,59 +1,163 @@
 {
-  "_comment": "ComfyUI SDXL storyboard shot generation workflow template. Combines character and scene context via IP-Adapter. Adjust node IDs to match your installation.",
   "1": {
-    "class_type": "CheckpointLoaderSimple",
+    "class_type": "UNETLoader",
     "inputs": {
-      "ckpt_name": "sd_xl_base_1.0.safetensors"
+      "unet_name": "flux-2-klein-base-4b.safetensors",
+      "weight_dtype": "default"
     }
   },
   "2": {
-    "class_type": "CLIPTextEncode",
+    "class_type": "CLIPLoader",
     "inputs": {
-      "text": "__PROMPT_PLACEHOLDER__",
-      "clip": ["1", 1]
+      "clip_name": "qwen_3_4b.safetensors",
+      "type": "flux2",
+      "device": "default"
     }
   },
   "3": {
-    "class_type": "CLIPTextEncode",
+    "class_type": "VAELoader",
     "inputs": {
-      "text": "blurry, low quality, watermark, text, deformed, extra limbs, bad anatomy, ugly",
-      "clip": ["1", 1]
+      "vae_name": "flux2-vae.safetensors"
     }
   },
   "4": {
-    "class_type": "EmptyLatentImage",
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "__PROMPT_PLACEHOLDER__",
+      "clip": [
+        "2",
+        0
+      ]
+    }
+  },
+  "5": {
+    "class_type": "FluxGuidance",
+    "inputs": {
+      "conditioning": [
+        "4",
+        0
+      ],
+      "guidance": 4.0
+    }
+  },
+  "6": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "__REF_IMAGE_PLACEHOLDER__"
+    }
+  },
+  "7": {
+    "class_type": "VAEEncode",
+    "inputs": {
+      "pixels": [
+        "6",
+        0
+      ],
+      "vae": [
+        "3",
+        0
+      ]
+    }
+  },
+  "8": {
+    "class_type": "ReferenceLatent",
+    "inputs": {
+      "conditioning": [
+        "5",
+        0
+      ],
+      "latent": [
+        "7",
+        0
+      ]
+    }
+  },
+  "9": {
+    "class_type": "BasicGuider",
+    "inputs": {
+      "model": [
+        "1",
+        0
+      ],
+      "conditioning": [
+        "8",
+        0
+      ]
+    }
+  },
+  "10": {
+    "class_type": "RandomNoise",
+    "inputs": {
+      "noise_seed": 0
+    }
+  },
+  "11": {
+    "class_type": "KSamplerSelect",
+    "inputs": {
+      "sampler_name": "euler"
+    }
+  },
+  "12": {
+    "class_type": "Flux2Scheduler",
+    "inputs": {
+      "steps": 20,
+      "width": 1024,
+      "height": 576
+    }
+  },
+  "13": {
+    "class_type": "EmptyFlux2LatentImage",
     "inputs": {
       "width": 1024,
       "height": 576,
       "batch_size": 1
     }
   },
-  "5": {
-    "class_type": "KSampler",
+  "14": {
+    "class_type": "SamplerCustomAdvanced",
     "inputs": {
-      "model": ["1", 0],
-      "positive": ["2", 0],
-      "negative": ["3", 0],
-      "latent_image": ["4", 0],
-      "seed": 42,
-      "steps": 30,
-      "cfg": 7.0,
-      "sampler_name": "euler_ancestral",
-      "scheduler": "karras",
-      "denoise": 1.0
+      "noise": [
+        "10",
+        0
+      ],
+      "guider": [
+        "9",
+        0
+      ],
+      "sampler": [
+        "11",
+        0
+      ],
+      "sigmas": [
+        "12",
+        0
+      ],
+      "latent_image": [
+        "13",
+        0
+      ]
     }
   },
-  "6": {
+  "15": {
     "class_type": "VAEDecode",
     "inputs": {
-      "samples": ["5", 0],
-      "vae": ["1", 2]
+      "samples": [
+        "14",
+        0
+      ],
+      "vae": [
+        "3",
+        0
+      ]
     }
   },
-  "7": {
+  "16": {
     "class_type": "SaveImage",
     "inputs": {
-      "images": ["6", 0],
+      "images": [
+        "15",
+        0
+      ],
       "filename_prefix": "shot"
     }
   }

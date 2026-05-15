@@ -13,7 +13,7 @@ logger = get_logger(__name__)
 # Expected structure constants
 # ---------------------------------------------------------------------------
 
-REQUIRED_SCRIPT_KEYS = {"title", "style", "episodes"}
+REQUIRED_SCRIPT_KEYS = {"title", "style", "characters", "episodes"}
 REQUIRED_EPISODE_KEYS = {"episode", "scenes"}
 REQUIRED_SCENE_KEYS = {"scene_id", "location", "shots"}
 REQUIRED_SHOT_KEYS = {
@@ -22,11 +22,17 @@ REQUIRED_SHOT_KEYS = {
     "characters",
     "dialogue",
     "visual_prompt",
+    "motion_prompt",
     "camera_move",
     "duration",
     "mood",
 }
+MAX_SHOT_DURATION_SECONDS = 5.0
 VALID_SHOT_TYPES = {"全景", "中景", "特写", "近景", "远景", "俯视", "仰视"}
+VALID_CAMERA_MOVES = {
+    "static", "slow pan down", "slight zoom in",
+    "slow push-in", "slow tracking", "handheld shake",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +79,15 @@ def validate_script(script: dict[str, Any]) -> tuple[bool, list[str]]:
 
     character_names: set[str] = set()
 
+    # --- Character design cards ---
+    for char in script.get("characters", []):
+        if not isinstance(char, dict):
+            errors.append("[characters] Each entry must be a dict.")
+            continue
+        for key in ("name", "appearance", "flux_prompt"):
+            if key not in char or not str(char[key]).strip():
+                errors.append(f"[characters] Character missing '{key}'.")
+
     for ep_idx, episode in enumerate(script.get("episodes", [])):
         ep_ctx = f"episode[{ep_idx}]"
         errors.extend(_check_keys(episode, REQUIRED_EPISODE_KEYS, ep_ctx))
@@ -93,6 +108,19 @@ def validate_script(script: dict[str, Any]) -> tuple[bool, list[str]]:
                         f"Valid values: {sorted(VALID_SHOT_TYPES)}"
                     )
 
+                # Validate camera move
+                cam = shot.get("camera_move", "")
+                if cam and cam not in VALID_CAMERA_MOVES:
+                    errors.append(
+                        f"[{sh_ctx}] Unknown camera_move '{cam}'. "
+                        f"Valid values: {sorted(VALID_CAMERA_MOVES)}"
+                    )
+
+                # Validate motion_prompt is non-empty
+                mp = shot.get("motion_prompt", "")
+                if isinstance(mp, str) and not mp.strip():
+                    errors.append(f"[{sh_ctx}] 'motion_prompt' must not be empty.")
+
                 # Validate characters list
                 for char in shot.get("characters", []):
                     if not isinstance(char, str) or not char.strip():
@@ -100,7 +128,7 @@ def validate_script(script: dict[str, Any]) -> tuple[bool, list[str]]:
                     else:
                         character_names.add(char.strip())
 
-                # Validate duration
+                # Validate duration. Over-limit durations are split before video generation.
                 duration = shot.get("duration")
                 if duration is not None and (not isinstance(duration, (int, float)) or duration <= 0):
                     errors.append(f"[{sh_ctx}] 'duration' must be a positive number, got {duration!r}.")

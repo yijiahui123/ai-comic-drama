@@ -1,0 +1,30 @@
+# Asset and generation policy for AI Comic Drama.
+# Character and style LoRAs are optional. If disabled or absent, the pipeline
+# falls back to reference images, expression images, and stable prompts.
+
+comfyui_models_root: ""
+
+style_lora:
+  enabled: false
+  name: ""
+  strength_model: 0.7
+  strength_clip: 0.7
+
+character_loras:
+  enabled: false
+  optional: true
+
+references:
+  prefer_library_assets: true
+  generate_missing_assets: true
+  use_character_reference_for_shots: true
+  use_expression_reference_for_shots: true
+
+continuity:
+  max_shot_duration_seconds: 5
+  split_long_actions: true
+  use_previous_tail_frame: true
+
+voice:
+  scene_level_tts: true
+  fallback_per_shot_tts: true

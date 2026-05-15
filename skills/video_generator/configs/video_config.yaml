@@ -1,18 +1,68 @@
-# Video generation parameters for Wan2.1 via ComfyUI
-video:
-  model: "wan2.1-14b"        # Model name as registered in ComfyUI
-  width: 1280                # Output video width (pixels)
-  height: 720                # Output video height (pixels)
-  fps: 8                     # Frames per second
-  steps: 25                  # Diffusion sampling steps
-  cfg: 6.0                   # Classifier-free guidance scale
-  seed: -1                   # -1 = random seed per shot
+# Video generation parameters for Wan 2.2 via ComfyUI
+#
+# mode: "14b_two_stage" — 14B I2V with LightX2V LoRA, two-stage sampling (high+low noise)
+#       "5b_single"     — 5B TI2V single model, single-stage sampling (faster, lower quality)
 
-# Fallback model when memory is constrained
-fallback:
-  model: "cogvideox-5b"
+mode: "5b_single"
+
+# ============================================================
+# 5B TI2V single-stage config
+# ============================================================
+video_5b:
+  model: "wan2.2_ti2v_5B_fp16.safetensors"
+  text_encoder: "umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+  vae: "wan2.2_vae.safetensors"
+
   width: 848
   height: 480
-  fps: 8
+  fps: 24
   steps: 20
-  cfg: 6.0
+  cfg: 5.0
+  sampler_name: "uni_pc"
+  scheduler: "simple"
+  shift: 8.0
+  seed: -1                  # -1 = random seed per shot
+
+# ============================================================
+# 14B I2V two-stage config (original, slower but higher quality)
+# ============================================================
+video_14b:
+  model: "wan2.2_i2v_high_noise_14B_fp16.safetensors"
+  model_low_noise: "wan2.2_i2v_low_noise_14B_fp16.safetensors"
+  text_encoder: "umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+  vae: "wan2.1_vae.safetensors"
+
+  lora_high_noise: "wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors"
+  lora_low_noise: "wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors"
+
+  width: 1280
+  height: 704
+  fps: 8
+  steps: 4
+  cfg: 1.0
+  sampler_name: "euler"
+  scheduler: "simple"
+  shift: 5.0
+  seed: -1
+
+# ============================================================
+# Legacy keys (kept for backward compatibility with orchestrator)
+# ============================================================
+video:
+  model: "wan2.2_ti2v_5B_fp16.safetensors"
+  model_low_noise: "wan2.2_i2v_low_noise_14B_fp16.safetensors"
+  text_encoder: "umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+  vae: "wan2.2_vae.safetensors"
+
+  lora_high_noise: "wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors"
+  lora_low_noise: "wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors"
+
+  width: 848
+  height: 480
+  fps: 24
+  steps: 20
+  cfg: 5.0
+  sampler_name: "uni_pc"
+  scheduler: "simple"
+  shift: 8.0
+  seed: -1

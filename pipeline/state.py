@@ -73,6 +73,12 @@ class PipelineState(BaseModel):
     script: Optional[dict[str, Any]] = None
     asset_manifest: dict[str, list[str]] = Field(default_factory=dict)
     video_manifest: dict[str, list[str]] = Field(default_factory=dict)
+    asset_sources: dict[str, dict[str, str]] = Field(default_factory=dict)
+    progress_current: int = 0
+    progress_total: int = 0
+    last_message: Optional[str] = None
+    events: list[dict[str, Any]] = Field(default_factory=list)
+    previews: dict[str, list[str]] = Field(default_factory=dict)
     final_video: Optional[str] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -85,6 +91,44 @@ class PipelineState(BaseModel):
         """Return ``True`` if *stage* has completed successfully."""
         result = self.stages.get(stage.value)
         return result is not None and result.status == "done"
+
+    def update_progress(
+        self,
+        message: str,
+        current: Optional[int] = None,
+        total: Optional[int] = None,
+        event_type: str = "progress",
+    ) -> None:
+        """Update progress fields and append a small event for UI clients."""
+        if current is not None:
+            self.progress_current = current
+        if total is not None:
+            self.progress_total = total
+        self.last_message = message
+        self.events.append(
+            {
+                "type": event_type,
+                "stage": self.current_stage.value,
+                "message": message,
+                "current": self.progress_current,
+                "total": self.progress_total,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        # Keep state files bounded while still useful for UI event replay.
+        self.events = self.events[-500:]
+
+    def set_previews(self) -> None:
+        """Populate preview lists from current manifests and final output."""
+        self.previews = {
+            "characters": self.asset_manifest.get("characters", [])[:50],
+            "scenes": self.asset_manifest.get("scenes", [])[:50],
+            "shots": self.asset_manifest.get("shots", [])[:100],
+            "videos": self.video_manifest.get("videos", [])[:100],
+            "audio": self.video_manifest.get("audio", [])[:100],
+            "lipsync": self.video_manifest.get("lipsync", [])[:100],
+            "final": [self.final_video] if self.final_video else [],
+        }
 
     def next_stage(self) -> Optional[Stage]:
         """Return the next stage to execute, or ``None`` if done/error."""
@@ -112,6 +156,7 @@ class PipelineState(BaseModel):
         state_dir.mkdir(parents=True, exist_ok=True)
         path = state_dir / f"{self.project_id}.json"
         self.updated_at = datetime.now(timezone.utc)
+        self.set_previews()
         path.write_text(
             self.model_dump_json(indent=2),
             encoding="utf-8",

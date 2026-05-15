@@ -3,6 +3,9 @@
 
 # --- Async HTTP ---
 aiohttp>=3.9.0
+fastapi>=0.111.0
+uvicorn>=0.29.0
+python-multipart>=0.0.9
 
 # --- Data modelling & validation ---
 pydantic>=2.5.0

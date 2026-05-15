@@ -69,15 +69,15 @@
     "class_type": "Flux2Scheduler",
     "inputs": {
       "steps": 20,
-      "width": 1344,
-      "height": 768
+      "width": 1024,
+      "height": 576
     }
   },
   "10": {
     "class_type": "EmptyFlux2LatentImage",
     "inputs": {
-      "width": 1344,
-      "height": 768,
+      "width": 1024,
+      "height": 576,
       "batch_size": 1
     }
   },
@@ -126,7 +126,7 @@
         "12",
         0
       ],
-      "filename_prefix": "scene"
+      "filename_prefix": "shot"
     }
   }
 }

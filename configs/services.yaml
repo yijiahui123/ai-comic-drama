@@ -1,15 +1,46 @@
 # Service endpoints for the AI Comic Drama pipeline
 # Edit these values to match your local deployment.
 
-ollama:
-  url: "http://localhost:11434"
-  model: "llama3.1:70b-instruct-q4_K_M"
-  # Alternative: "qwen2.5:72b-q4_K_M"
+llm:
+  url: "http://127.0.0.1:8000/v1"
+  model: "Qwen3.6-35B-A3B-MLX-8bit"
+  api_key: "0918"
   timeout: 300  # seconds
 
 comfyui:
   url: "http://localhost:8188"
   timeout: 600  # seconds (video generation is slow)
+  models:
+    # --- Flux.2 Klein 4B (image generation) ---
+    flux_diffusion_model:
+      name: "flux-2-klein-base-4b-fp8.safetensors"
+      url: "https://huggingface.co/black-forest-labs/FLUX.2-klein-base-4b-fp8/resolve/main/flux-2-klein-base-4b-fp8.safetensors"
+      directory: "diffusion_models"
+    flux_text_encoder:
+      name: "qwen_3_4b.safetensors"
+      url: "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/text_encoders/qwen_3_4b.safetensors"
+      directory: "text_encoders"
+    flux_vae:
+      name: "flux2-vae.safetensors"
+      url: "https://huggingface.co/Comfy-Org/flux2-dev/resolve/main/split_files/vae/flux2-vae.safetensors"
+      directory: "vae"
+    # --- Wan 2.2 (video generation) ---
+    wan_i2v_model:
+      name: "wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors"
+      url: "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors"
+      directory: "diffusion_models"
+    wan_t2v_model:
+      name: "wan2.2_t2v_high_noise_14B_fp8_scaled.safetensors"
+      url: "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_t2v_high_noise_14B_fp8_scaled.safetensors"
+      directory: "diffusion_models"
+    wan_text_encoder:
+      name: "umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+      url: "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+      directory: "text_encoders"
+    wan_vae:
+      name: "wan2.2_vae.safetensors"
+      url: "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/vae/wan2.2_vae.safetensors"
+      directory: "vae"
 
 chattts:
   url: "http://localhost:9966"
