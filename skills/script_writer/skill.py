@@ -107,6 +107,23 @@ class ScriptWriter:
         self._api_key = api_key
         self._outline_prompt = _load_prompt("system_outline.txt")
         self._scene_prompt = _load_prompt("system_scene.txt")
+        self._session: aiohttp.ClientSession | None = None
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def close(self) -> None:
+        """Close the underlying HTTP session."""
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
+
+    async def __aenter__(self) -> "ScriptWriter":
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.close()
 
     # ------------------------------------------------------------------
     # Public API
@@ -192,17 +209,19 @@ class ScriptWriter:
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
 
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(timeout=timeout)
+
         for attempt in range(1, _MAX_RETRIES + 2):
             try:
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.post(
-                        f"{self.base_url}{_CHAT_COMPLETIONS_PATH}",
-                        json=payload,
-                        headers=headers,
-                    ) as resp:
-                        resp.raise_for_status()
-                        data = await resp.json()
-                        return data["choices"][0]["message"]["content"]
+                async with self._session.post(
+                    f"{self.base_url}{_CHAT_COMPLETIONS_PATH}",
+                    json=payload,
+                    headers=headers,
+                ) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json()
+                    return data["choices"][0]["message"]["content"]
             except (aiohttp.ClientError, asyncio.TimeoutError, KeyError, IndexError) as exc:
                 last_exc = exc
                 if attempt <= _MAX_RETRIES:

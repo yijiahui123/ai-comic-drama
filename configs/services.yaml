@@ -56,12 +56,3 @@ sadtalker:
 memory:
   unload_between_stages: true   # Set to false to skip unloading (useful for debugging)
   gc_delay: 2                   # Seconds to wait after unloading before starting next stage
-
-# Output configuration
-output:
-  root: "output"
-  state_dir: "output/state"
-  videos_dir: "output/videos"
-  audio_dir: "output/audio"
-  lipsync_dir: "output/lipsync"
-  final_dir: "output/final"

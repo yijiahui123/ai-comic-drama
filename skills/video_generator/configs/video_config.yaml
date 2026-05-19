@@ -44,25 +44,3 @@ video_14b:
   scheduler: "simple"
   shift: 5.0
   seed: -1
-
-# ============================================================
-# Legacy keys (kept for backward compatibility with orchestrator)
-# ============================================================
-video:
-  model: "wan2.2_ti2v_5B_fp16.safetensors"
-  model_low_noise: "wan2.2_i2v_low_noise_14B_fp16.safetensors"
-  text_encoder: "umt5_xxl_fp8_e4m3fn_scaled.safetensors"
-  vae: "wan2.2_vae.safetensors"
-
-  lora_high_noise: "wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors"
-  lora_low_noise: "wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors"
-
-  width: 848
-  height: 480
-  fps: 24
-  steps: 20
-  cfg: 5.0
-  sampler_name: "uni_pc"
-  scheduler: "simple"
-  shift: 8.0
-  seed: -1

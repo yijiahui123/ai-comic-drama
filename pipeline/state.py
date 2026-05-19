@@ -7,12 +7,15 @@ the pipeline can resume after an interruption.
 from __future__ import annotations
 
 import json
+import os
+import time
 from datetime import datetime, timezone
 from enum import Enum
-from pathlib import Path
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field
+
+from utils.paths import PROJECT_ROOT
 
 
 class Stage(str, Enum):
@@ -50,6 +53,38 @@ class StageResult(BaseModel):
     output_summary: Optional[str] = None
 
 
+class QualityCheck(BaseModel):
+    """One heuristic quality check result for a shot or project artifact."""
+
+    name: str
+    status: str = "pending"  # pass | warn | fail | pending | skipped
+    message: str = ""
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class ShotState(BaseModel):
+    """Production state for a single shot."""
+
+    shot_id: str
+    scene_id: str = ""
+    status: str = "pending"  # pending | ready | needs_retry | needs_review | approved | failed
+    locked: bool = False
+    review_status: str = "pending"  # pending | approved | rejected | needs_retry
+    script: dict[str, Any] = Field(default_factory=dict)
+    assets: dict[str, str] = Field(default_factory=dict)
+    outputs: dict[str, str] = Field(default_factory=dict)
+    sources: dict[str, str] = Field(default_factory=dict)
+    quality_checks: list[QualityCheck] = Field(default_factory=list)
+    retry_count: int = 0
+    max_retries: int = 2
+    last_error: Optional[str] = None
+    generation_params: dict[str, Any] = Field(default_factory=dict)
+    progress_pct: int = 0
+    progress_node: str = ""
+    eta_seconds: float = 0
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
 class PipelineState(BaseModel):
     """Complete state for one pipeline run.
 
@@ -74,14 +109,22 @@ class PipelineState(BaseModel):
     asset_manifest: dict[str, list[str]] = Field(default_factory=dict)
     video_manifest: dict[str, list[str]] = Field(default_factory=dict)
     asset_sources: dict[str, dict[str, str]] = Field(default_factory=dict)
+    queue_status: str = "idle"  # idle | queued | running | canceled | completed | failed
+    shot_states: dict[str, ShotState] = Field(default_factory=dict)
+    quality_report: dict[str, Any] = Field(default_factory=dict)
+    review_queue: list[str] = Field(default_factory=list)
+    export_manifest: dict[str, Any] = Field(default_factory=dict)
     progress_current: int = 0
     progress_total: int = 0
     last_message: Optional[str] = None
     events: list[dict[str, Any]] = Field(default_factory=list)
     previews: dict[str, list[str]] = Field(default_factory=dict)
-    final_video: Optional[str] = None
+    final_video: Optional[str] = None  # Deprecated: kept for backwards compat
+    final_videos: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    _last_save_time: float = 0.0
 
     # ------------------------------------------------------------------
     # Helpers
@@ -120,6 +163,7 @@ class PipelineState(BaseModel):
 
     def set_previews(self) -> None:
         """Populate preview lists from current manifests and final output."""
+        finals = self.final_videos or ([self.final_video] if self.final_video else [])
         self.previews = {
             "characters": self.asset_manifest.get("characters", [])[:50],
             "scenes": self.asset_manifest.get("scenes", [])[:50],
@@ -127,7 +171,7 @@ class PipelineState(BaseModel):
             "videos": self.video_manifest.get("videos", [])[:100],
             "audio": self.video_manifest.get("audio", [])[:100],
             "lipsync": self.video_manifest.get("lipsync", [])[:100],
-            "final": [self.final_video] if self.final_video else [],
+            "final": finals,
         }
 
     def next_stage(self) -> Optional[Stage]:
@@ -144,27 +188,35 @@ class PipelineState(BaseModel):
     # Persistence
     # ------------------------------------------------------------------
 
-    def save(self, state_dir: Path = Path("output/state")) -> Path:
+    def save(self, state_dir: "Path" = PROJECT_ROOT / "output" / "state", force: bool = False) -> "Path":
         """Persist this state object to a JSON file.
 
         Args:
             state_dir: Directory in which to write the state file.
+            force: If ``True``, skip the 2-second throttle (e.g. on stage change).
 
         Returns:
-            Path to the written JSON file.
+            Path to the written JSON file, or the expected path if throttled.
         """
-        state_dir.mkdir(parents=True, exist_ok=True)
         path = state_dir / f"{self.project_id}.json"
+        # Throttle: skip write if < 2 seconds since last save (unless forced)
+        now = time.monotonic()
+        if not force and (now - self._last_save_time) < 2.0:
+            return path
+        state_dir.mkdir(parents=True, exist_ok=True)
         self.updated_at = datetime.now(timezone.utc)
         self.set_previews()
-        path.write_text(
+        tmp_path = path.with_suffix(".tmp")
+        tmp_path.write_text(
             self.model_dump_json(indent=2),
             encoding="utf-8",
         )
+        os.replace(str(tmp_path), str(path))
+        self._last_save_time = time.monotonic()
         return path
 
     @classmethod
-    def load(cls, project_id: str, state_dir: Path = Path("output/state")) -> "PipelineState":
+    def load(cls, project_id: str, state_dir: "Path" = PROJECT_ROOT / "output" / "state") -> "PipelineState":
         """Load a state object from disk.
 
         Args:
@@ -203,7 +255,8 @@ class PipelineState(BaseModel):
             else:
                 lines.append(f"  {stage.value:<12} PENDING")
 
-        if self.final_video:
-            lines.append(f"\nFinal video: {self.final_video}")
+        finals = self.final_videos or ([self.final_video] if self.final_video else [])
+        for v in finals:
+            lines.append(f"\nFinal video: {v}")
 
         return "\n".join(lines)

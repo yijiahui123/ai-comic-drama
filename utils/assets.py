@@ -11,12 +11,13 @@ from typing import Any, Optional
 import yaml
 
 from utils import slugify
+from utils.paths import PROJECT_ROOT
 from utils.validators import MAX_SHOT_DURATION_SECONDS
 
 
-ASSET_CONFIG_PATH = Path("configs/assets.yaml")
-ASSET_MANIFEST_PATH = Path("assets/library/manifest.yaml")
-ASSETS_ROOT = Path("assets")
+ASSET_CONFIG_PATH = PROJECT_ROOT / "configs" / "assets.yaml"
+ASSET_MANIFEST_PATH = PROJECT_ROOT / "assets" / "library" / "manifest.yaml"
+ASSETS_ROOT = PROJECT_ROOT / "assets"
 
 EXPRESSION_VARIANTS = ["neutral", "happy", "surprised", "angry", "sad"]
 
@@ -120,6 +121,7 @@ def load_asset_manifest(path: Path = ASSET_MANIFEST_PATH) -> dict[str, Any]:
     manifest.setdefault("characters", {})
     manifest.setdefault("scenes", {})
     manifest.setdefault("shots", {})
+    manifest.setdefault("scene_audio", {})
     return manifest
 
 
@@ -138,6 +140,7 @@ def save_asset_manifest(manifest: dict[str, Any], path: Path = ASSET_MANIFEST_PA
     manifest.setdefault("characters", {})
     manifest.setdefault("scenes", {})
     manifest.setdefault("shots", {})
+    manifest.setdefault("scene_audio", {})
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         yaml.safe_dump(manifest, allow_unicode=True, sort_keys=False),
@@ -152,6 +155,28 @@ def repo_path(path_value: str | Path | None) -> Optional[Path]:
         return None
     path = Path(path_value).expanduser()
     return path if path.is_absolute() else Path.cwd() / path
+
+
+def lora_search_roots(models_root_value: str | Path | None) -> list[Path]:
+    """Return likely LoRA directories for a ComfyUI root or models directory."""
+    root = repo_path(models_root_value)
+    if not root or not root.exists():
+        return []
+
+    candidates = [
+        root / "loras",
+        root / "models" / "loras",
+    ]
+    if root.name.lower() == "loras":
+        candidates.insert(0, root)
+    return [path for path in dict.fromkeys(candidates) if path.exists()]
+
+
+def lora_exists(name: str, models_root_value: str | Path | None) -> bool:
+    """Check whether a LoRA file exists without loading the model."""
+    if not name:
+        return False
+    return any((root / name).exists() for root in lora_search_roots(models_root_value))
 
 
 def canonical_character_reference(character: str, assets_root: Path = ASSETS_ROOT) -> Path:
@@ -367,18 +392,34 @@ def validate_asset_setup(
     if style_lora.get("enabled") and not style_lora.get("name"):
         errors.append("style_lora is enabled but has no name")
 
-    root = repo_path(config.get("comfyui_models_root"))
-    if root and root.exists():
-        lora_root = root / "loras"
+    lora_roots = lora_search_roots(config.get("comfyui_models_root"))
+    if config.get("comfyui_models_root") and not lora_roots:
+        warnings.append(
+            "comfyui_models_root is set but no loras directory was found; expected <root>/loras or <root>/models/loras"
+        )
+    if lora_roots:
         if style_lora.get("enabled") and style_lora.get("name"):
-            if not (lora_root / style_lora["name"]).exists():
+            if not lora_exists(style_lora["name"], config.get("comfyui_models_root")):
                 errors.append(f"Missing style LoRA in ComfyUI loras directory: {style_lora['name']}")
         for character, data in manifest.get("characters", {}).items():
             lora = (data or {}).get("lora") or {}
-            if lora.get("enabled") and lora.get("name") and not (lora_root / lora["name"]).exists():
+            if lora.get("enabled") and lora.get("name") and not lora_exists(
+                lora["name"], config.get("comfyui_models_root")
+            ):
                 optional = config.get("character_loras", {}).get("optional", True)
                 msg = f"Missing character LoRA in ComfyUI loras directory for {character}: {lora['name']}"
                 (warnings if optional else errors).append(msg)
+
+    for scene_id, data in manifest.get("scene_audio", {}).items():
+        if not isinstance(data, dict):
+            errors.append(f"scene_audio.{scene_id} must be a mapping")
+            continue
+        audio_path = repo_path(data.get("audio_path"))
+        if data.get("audio_path") and (audio_path is None or not audio_path.exists()):
+            warnings.append(f"Scene audio is configured but missing for {scene_id}: {data.get('audio_path')}")
+        segments = data.get("segments", [])
+        if segments and not isinstance(segments, list):
+            errors.append(f"scene_audio.{scene_id}.segments must be a list")
 
     return {
         "ok": not errors,

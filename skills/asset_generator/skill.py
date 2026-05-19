@@ -42,8 +42,11 @@ from utils.assets import (
     normalize_shot_emotion,
 )
 from utils.logger import get_logger
+from utils.paths import PROJECT_ROOT
 
 logger = get_logger(__name__)
+
+from utils.comfyui import post_with_retry as _post_with_retry, poll_comfyui_ws as _poll_comfyui_ws
 
 # Default paths to ComfyUI workflow template files
 _WORKFLOWS_DIR = Path(__file__).parent / "workflows"
@@ -59,7 +62,7 @@ _POLL_INTERVAL = 3.0   # seconds
 _POLL_TIMEOUT = 600.0  # seconds (10 min)
 
 # Assets root
-_ASSETS_ROOT = Path("assets")
+_ASSETS_ROOT = PROJECT_ROOT / "assets"
 
 
 def _load_workflow(filename: str) -> dict[str, Any]:
@@ -88,6 +91,7 @@ class AssetGenerator:
         comfyui_url: str = "http://localhost:8188",
         assets_root: Path = _ASSETS_ROOT,
         progress_callback: Optional[Callable[[str, int, int], None]] = None,
+        shot_progress_callback: Optional[Callable[[str, int, float, str], None]] = None,
     ) -> None:
         """
         Args:
@@ -95,10 +99,12 @@ class AssetGenerator:
             assets_root: Root directory where generated assets will be saved.
             progress_callback: Optional callable ``(message, current, total)`` for
                 progress reporting.
+            shot_progress_callback: ``(asset_key, pct, eta_seconds, node)`` for per-asset progress.
         """
         self.comfyui_url = comfyui_url.rstrip("/")
         self.assets_root = Path(assets_root)
         self._progress_callback = progress_callback
+        self._shot_progress_callback = shot_progress_callback
         self._session: Optional[aiohttp.ClientSession] = None
         self._asset_config = load_asset_config()
         self._library = AssetLibrary(load_asset_manifest(), self._asset_config)
@@ -302,7 +308,7 @@ class AssetGenerator:
             workflow = _load_workflow("character_gen.json")
             workflow = self._inject_prompt(workflow, prompt)
             workflow = self._inject_loras(workflow, [self._library.style_lora(), self._library.character_lora(char_name)])
-            image_bytes = await self._run_workflow(workflow)
+            image_bytes = await self._run_workflow(workflow, context=f"char:{char_name}")
             if image_bytes:
                 ref_path.write_bytes(image_bytes)
                 logger.info("Saved character reference: %s", ref_path)
@@ -350,7 +356,7 @@ class AssetGenerator:
                     workflow = _load_workflow("character_gen.json")
                     workflow = self._inject_prompt(workflow, prompt)
                 workflow = self._inject_loras(workflow, [self._library.style_lora(), self._library.character_lora(char_name)])
-                image_bytes = await self._run_workflow(workflow)
+                image_bytes = await self._run_workflow(workflow, context=f"expr:{char_name}:{expression}")
                 if image_bytes:
                     expr_path.write_bytes(image_bytes)
                     logger.debug("Saved expression variant: %s", expr_path)
@@ -394,7 +400,7 @@ class AssetGenerator:
         workflow = _load_workflow("scene_gen.json")
         workflow = self._inject_prompt(workflow, prompt)
         workflow = self._inject_loras(workflow, [self._library.style_lora()])
-        image_bytes = await self._run_workflow(workflow)
+        image_bytes = await self._run_workflow(workflow, context=f"scene:{scene.get('scene_id', '')}")
         if image_bytes:
             out_path.write_bytes(image_bytes)
             logger.info("Saved scene background: %s", out_path)
@@ -445,7 +451,7 @@ class AssetGenerator:
         for character in shot.get("characters", []):
             loras.append(self._library.character_lora(character))
         workflow = self._inject_loras(workflow, loras)
-        image_bytes = await self._run_workflow(workflow)
+        image_bytes = await self._run_workflow(workflow, context=shot.get("shot_id", ""))
         if image_bytes:
             out_path.write_bytes(image_bytes)
             logger.info("Saved shot image: %s", out_path)
@@ -598,12 +604,13 @@ class AssetGenerator:
         session = self._get_session()
         try:
             data = aiohttp.FormData()
-            data.add_field(
-                "image",
-                open(image_path, "rb"),
-                filename=image_path.name,
-                content_type="image/png",
-            )
+            with open(image_path, "rb") as fh:
+                data.add_field(
+                    "image",
+                    fh,
+                    filename=image_path.name,
+                    content_type="image/png",
+                )
             async with session.post(
                 f"{self.comfyui_url}{_COMFYUI_UPLOAD_PATH}",
                 data=data,
@@ -615,11 +622,14 @@ class AssetGenerator:
             logger.error("Failed to upload image %s: %s", image_path, exc)
             return None
 
-    async def _run_workflow(self, workflow: dict[str, Any]) -> Optional[bytes]:
+    async def _run_workflow(self, workflow: dict[str, Any], context: str = "") -> Optional[bytes]:
         """Submit *workflow* to ComfyUI and poll until the image is ready.
+
+        Uses WebSocket for real-time progress, falls back to HTTP polling.
 
         Args:
             workflow: ComfyUI workflow dictionary.
+            context: Asset identifier for progress reporting (e.g. shot_id).
 
         Returns:
             Raw image bytes, or ``None`` if the workflow failed.
@@ -630,19 +640,39 @@ class AssetGenerator:
 
         # Submit
         try:
-            async with session.post(
-                f"{self.comfyui_url}{_COMFYUI_PROMPT_PATH}",
-                json=payload,
-            ) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
-                prompt_id: str = data["prompt_id"]
+            data = await _post_with_retry(
+                session, f"{self.comfyui_url}{_COMFYUI_PROMPT_PATH}", payload,
+            )
+            prompt_id: str = data["prompt_id"]
+        except (ConnectionError, TimeoutError) as exc:
+            logger.error("ComfyUI prompt submission failed: %s", exc)
+            return None
         except Exception as exc:  # noqa: BLE001
             logger.error("ComfyUI prompt submission failed: %s", exc)
             return None
 
-        # Poll for completion
-        deadline = time.monotonic() + _POLL_TIMEOUT
+        # WebSocket progress tracking
+        t0 = time.monotonic()
+        def _on_ws_progress(val: int, mx: int, node: str) -> None:
+            if mx > 0:
+                pct = int(val / mx * 100)
+                elapsed = time.monotonic() - t0
+                eta = (elapsed / val * (mx - val)) if val > 0 else 0
+                if self._progress_callback:
+                    self._progress_callback(
+                        f"生成中 {pct}% — 节点 {node or '...'} — ETA {int(eta)}s",
+                        val, mx,
+                    )
+                if self._shot_progress_callback and context:
+                    self._shot_progress_callback(context, pct, eta, node or "")
+
+        ws_done = await _poll_comfyui_ws(
+            self.comfyui_url, prompt_id, client_id,
+            timeout=_POLL_TIMEOUT, on_progress=_on_ws_progress,
+        )
+
+        # Fetch result via HTTP
+        deadline = time.monotonic() + (0 if ws_done else _POLL_TIMEOUT)
         while time.monotonic() < deadline:
             await asyncio.sleep(_POLL_INTERVAL)
             try:
@@ -656,7 +686,7 @@ class AssetGenerator:
                 continue
 
             if prompt_id not in history:
-                continue  # Still running
+                continue
 
             outputs = history[prompt_id].get("outputs", {})
             for node_output in outputs.values():
@@ -668,6 +698,27 @@ class AssetGenerator:
                         image_info.get("subfolder", ""),
                         image_info.get("type", "output"),
                     )
+
+        # WS said done but HTTP didn't find it — retry once
+        if ws_done:
+            try:
+                async with session.get(
+                    f"{self.comfyui_url}{_COMFYUI_HISTORY_PATH.format(prompt_id=prompt_id)}"
+                ) as resp:
+                    resp.raise_for_status()
+                    history = await resp.json()
+                    if prompt_id in history:
+                        for node_output in history[prompt_id].get("outputs", {}).values():
+                            images = node_output.get("images", [])
+                            if images:
+                                image_info = images[0]
+                                return await self._download_image(
+                                    image_info["filename"],
+                                    image_info.get("subfolder", ""),
+                                    image_info.get("type", "output"),
+                                )
+            except Exception:  # noqa: BLE001
+                pass
 
         logger.error("ComfyUI workflow timed out after %.0fs", _POLL_TIMEOUT)
         return None

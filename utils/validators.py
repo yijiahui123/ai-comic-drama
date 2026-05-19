@@ -150,4 +150,24 @@ def validate_script(script: dict[str, Any]) -> tuple[bool, list[str]]:
         for err in errors:
             logger.warning("  %s", err)
 
+    # Episode duration warnings (non-blocking)
+    for ep_idx, episode in enumerate(script.get("episodes", [])):
+        ep_num = episode.get("episode", ep_idx + 1)
+        total_dur = sum(
+            float(shot.get("duration", 4) or 4)
+            for scene in episode.get("scenes", [])
+            for shot in scene.get("shots", [])
+        )
+        if total_dur < 20:
+            logger.warning(
+                "Episode %d total duration %.1fs is very short (target: ~30s). "
+                "Consider adding more scenes or shots.",
+                ep_num, total_dur,
+            )
+        elif total_dur < 28:
+            logger.info(
+                "Episode %d total duration %.1fs (target: ~30s).",
+                ep_num, total_dur,
+            )
+
     return is_valid, errors

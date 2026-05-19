@@ -58,7 +58,8 @@ class AssetUtilityTests(unittest.TestCase):
                     manifest={"characters": {}, "scenes": {}, "shots": {"S01": str(image)}}
                 )
                 self.assertEqual(lib.shot("S01"), image)
-                self.assertEqual(canonical_shot("S01"), Path("assets/shots/s01.png"))
+                from utils.paths import PROJECT_ROOT
+                self.assertEqual(canonical_shot("S01"), PROJECT_ROOT / "assets" / "shots" / "s01.png")
 
     def test_validate_asset_setup_reports_missing_manifest_asset(self):
         with tempfile.TemporaryDirectory() as tmp:

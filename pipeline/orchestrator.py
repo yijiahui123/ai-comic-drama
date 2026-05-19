@@ -17,28 +17,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-import yaml
-
 from pipeline.state import PipelineState, Stage, StageResult
 from skills.script_writer.skill import ScriptWriter
 from skills.asset_generator.skill import AssetGenerator
 from skills.video_generator.skill import VideoGenerator
 from skills.editor.skill import Editor
 from utils.assets import load_asset_config, normalize_script_for_generation
+from utils.config import load_services_config
 from utils.logger import get_pipeline_logger
 from utils.model_unloader import force_gc, unload_comfyui_models, kill_omlx_server
-
-
-_CONFIGS_DIR = Path("configs")
-
-
-def _load_services_config() -> dict[str, Any]:
-    """Load ``configs/services.yaml`` if it exists."""
-    path = _CONFIGS_DIR / "services.yaml"
-    if path.exists():
-        with path.open(encoding="utf-8") as fh:
-            return yaml.safe_load(fh) or {}
-    return {}
 
 
 class PipelineOrchestrator:
@@ -55,7 +42,7 @@ class PipelineOrchestrator:
         """
         self.state = state
         self.logger = get_pipeline_logger(state.project_id)
-        self._services = _load_services_config()
+        self._services = load_services_config()
 
     # ------------------------------------------------------------------
     # Factory methods
@@ -133,7 +120,7 @@ class PipelineOrchestrator:
             if script is None:
                 return self.state
             self.state.script = script
-            self.state.save()
+            self.state.save(force=True)
 
         # Unload LLM after scripting to free memory before asset generation
         if unload_enabled:
@@ -154,7 +141,7 @@ class PipelineOrchestrator:
             if manifest is None:
                 return self.state
             self.state.asset_manifest = {k: [str(p) for p in v] for k, v in manifest.items()}
-            self.state.save()
+            self.state.save(force=True)
 
         # Unload ComfyUI SDXL models after asset generation
         if unload_enabled:
@@ -173,11 +160,13 @@ class PipelineOrchestrator:
                 comfyui_url=comfyui_url,
                 chattts_url=svc.get("chattts", {}).get("url", "http://localhost:9966"),
                 sadtalker_url=svc.get("sadtalker", {}).get("url", "http://localhost:7860"),
+                chattts_enabled=svc.get("chattts", {}).get("enabled", True),
+                sadtalker_enabled=svc.get("sadtalker", {}).get("enabled", True),
             )
             if manifest is None:
                 return self.state
             self.state.video_manifest = {k: [str(p) for p in v] for k, v in manifest.items()}
-            self.state.save()
+            self.state.save(force=True)
 
         # Unload ComfyUI Wan 2.2 models after video generation
         if unload_enabled:
@@ -190,16 +179,17 @@ class PipelineOrchestrator:
 
         # --- Stage: EDITING ---
         if not self.state.is_stage_done(Stage.EDITING):
-            final_path = await self._run_stage(
+            final_paths = await self._run_stage(
                 Stage.EDITING,
                 self._do_editing,
             )
-            if final_path:
-                self.state.final_video = str(final_path)
-                self.state.save()
+            if final_paths:
+                self.state.final_videos = [str(p) for p in final_paths]
+                self.state.final_video = str(final_paths[-1])  # backwards compat
+                self.state.save(force=True)
 
         self.state.current_stage = Stage.DONE
-        self.state.save()
+        self.state.save(force=True)
         self.logger.info(
             "Pipeline DONE — final_video=%s", self.state.final_video
         )
@@ -224,20 +214,24 @@ class PipelineOrchestrator:
             self.state.asset_sources = {}
             self.state.video_manifest = {}
             self.state.final_video = None
+            self.state.final_videos = []
         elif stage == Stage.ASSET_GEN:
             self.state.asset_manifest = {}
             self.state.asset_sources = {}
             self.state.video_manifest = {}
             self.state.final_video = None
+            self.state.final_videos = []
         elif stage == Stage.VIDEO_GEN:
             self.state.video_manifest = {}
             self.state.final_video = None
+            self.state.final_videos = []
         elif stage == Stage.EDITING:
             self.state.final_video = None
+            self.state.final_videos = []
 
         self.state.current_stage = stage
         self.state.update_progress(f"Reset from stage {stage.value}", 0, 0, "reset")
-        self.state.save()
+        self.state.save(force=True)
 
     # ------------------------------------------------------------------
     # Stage runners
@@ -259,7 +253,7 @@ class PipelineOrchestrator:
         self.state.update_progress(f"Stage {stage.value} started", 0, 0, "stage_start")
         result = StageResult(stage=stage, status="running", started_at=datetime.now(timezone.utc))
         self.state.stages[stage.value] = result
-        self.state.save()
+        self.state.save(force=True)
 
         t0 = time.monotonic()
         try:
@@ -273,8 +267,10 @@ class PipelineOrchestrator:
                 "=== Stage %s: DONE (%.1fs) ===", stage.value, elapsed
             )
             self.state.update_progress(f"Stage {stage.value} done", self.state.progress_total, self.state.progress_total, "stage_done")
-            self.state.save()
+            self.state.save(force=True)
             return output
+        except (KeyboardInterrupt, SystemExit):
+            raise
         except Exception as exc:  # noqa: BLE001
             elapsed = time.monotonic() - t0
             result.status = "error"
@@ -286,7 +282,7 @@ class PipelineOrchestrator:
                 "=== Stage %s: ERROR (%.1fs): %s ===", stage.value, elapsed, exc
             )
             self.state.update_progress(f"Stage {stage.value} error: {exc}", self.state.progress_current, self.state.progress_total, "stage_error")
-            self.state.save()
+            self.state.save(force=True)
             return None
 
     # ------------------------------------------------------------------
@@ -295,8 +291,8 @@ class PipelineOrchestrator:
 
     async def _do_scripting(self, llm_url: str, model: str, api_key: str = "") -> dict[str, Any]:
         """Run the ScriptWriter skill."""
-        writer = ScriptWriter(base_url=llm_url, model=model, api_key=api_key or None)
-        script = await writer.generate(self.state.user_prompt)
+        async with ScriptWriter(base_url=llm_url, model=model, api_key=api_key or None) as writer:
+            script = await writer.generate(self.state.user_prompt)
         asset_cfg = load_asset_config()
         continuity = asset_cfg.get("continuity", {})
         return normalize_script_for_generation(
@@ -312,13 +308,15 @@ class PipelineOrchestrator:
         async with AssetGenerator(
             comfyui_url=comfyui_url,
             progress_callback=self._progress_callback("AssetGen"),
+            shot_progress_callback=self._shot_progress_callback,
         ) as gen:
             result = await gen.generate_all_assets(self.state.script)
             self.state.asset_sources = gen.asset_sources
             return result
 
     async def _do_video_gen(
-        self, comfyui_url: str, chattts_url: str, sadtalker_url: str
+        self, comfyui_url: str, chattts_url: str, sadtalker_url: str,
+        chattts_enabled: bool = True, sadtalker_enabled: bool = True,
     ) -> dict[str, Any]:
         """Run the VideoGenerator skill."""
         if self.state.script is None:
@@ -328,10 +326,13 @@ class PipelineOrchestrator:
             chattts_url=chattts_url,
             sadtalker_url=sadtalker_url,
             progress_callback=self._progress_callback("VideoGen"),
+            shot_progress_callback=self._shot_progress_callback,
+            chattts_enabled=chattts_enabled,
+            sadtalker_enabled=sadtalker_enabled,
         ) as gen:
             return await gen.generate_all(self.state.script)
 
-    async def _do_editing(self) -> Optional[Path]:
+    async def _do_editing(self) -> list[Path]:
         """Run the Editor skill."""
         if self.state.script is None:
             raise RuntimeError("No script available for editing.")
@@ -345,3 +346,12 @@ class PipelineOrchestrator:
             self.state.save()
 
         return _callback
+
+    def _shot_progress_callback(self, shot_id: str, pct: int, eta: float, node: str) -> None:
+        """Update per-shot progress from ComfyUI WebSocket."""
+        shot = self.state.shot_states.get(shot_id)
+        if shot:
+            shot.progress_pct = pct
+            shot.eta_seconds = round(eta, 1)
+            shot.progress_node = node
+            shot.updated_at = datetime.now(timezone.utc)

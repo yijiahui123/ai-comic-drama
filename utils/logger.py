@@ -1,11 +1,13 @@
 """Unified logging module with colored console output and file recording."""
 
 import logging
+import os
 import sys
-from pathlib import Path
+from logging.handlers import RotatingFileHandler
 from datetime import datetime
 from typing import Optional
 
+from utils.paths import PROJECT_ROOT
 
 # ANSI color codes
 _COLORS = {
@@ -17,7 +19,9 @@ _COLORS = {
     "RESET": "\033[0m",
 }
 
-LOG_DIR = Path("logs")
+LOG_DIR = PROJECT_ROOT / "logs"
+
+_LOG_LEVEL = getattr(logging, os.getenv("AI_COMIC_LOG_LEVEL", "INFO").upper(), logging.INFO)
 
 
 class ColoredFormatter(logging.Formatter):
@@ -47,9 +51,9 @@ def get_logger(name: str, log_file: Optional[str] = None) -> logging.Logger:
 
     logger.setLevel(logging.DEBUG)
 
-    # Console handler (colored)
+    # Console handler — level from AI_COMIC_LOG_LEVEL env (default INFO)
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.DEBUG)
+    console_handler.setLevel(_LOG_LEVEL)
     console_fmt = ColoredFormatter(
         fmt="%(asctime)s %(levelname)s [%(name)s] %(message)s",
         datefmt="%H:%M:%S",
@@ -57,7 +61,7 @@ def get_logger(name: str, log_file: Optional[str] = None) -> logging.Logger:
     console_handler.setFormatter(console_fmt)
     logger.addHandler(console_handler)
 
-    # File handler (plain text)
+    # File handler (plain text) — always DEBUG for full diagnostics
     if log_file:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         file_path = LOG_DIR / log_file
@@ -69,6 +73,18 @@ def get_logger(name: str, log_file: Optional[str] = None) -> logging.Logger:
         )
         file_handler.setFormatter(file_fmt)
         logger.addHandler(file_handler)
+
+    # Default rotating file handler (app.log) — always present
+    if not log_file:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        app_log = LOG_DIR / "app.log"
+        rf = RotatingFileHandler(app_log, maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8")
+        rf.setLevel(logging.DEBUG)
+        rf.setFormatter(logging.Formatter(
+            fmt="%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        logger.addHandler(rf)
 
     logger.propagate = False
     return logger

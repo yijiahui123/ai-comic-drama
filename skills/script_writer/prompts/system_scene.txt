@@ -86,5 +86,6 @@ Camera movement options (map to `camera_move` field):
 ## Guidelines
 
 - A scene should have 3–8 shots
+- Each episode must total approximately 30 seconds — distribute shots across scenes to reach this target (sum of all shot durations in the episode ≈ 30s)
 - Each shot_id must be unique: format <scene_id>-<3-digit-number>
 - Output ONLY the JSON, starting with `{` and ending with `}`

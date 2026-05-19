@@ -12,9 +12,7 @@ pydantic>=2.5.0
 
 # --- Configuration ---
 pyyaml>=6.0.1
-
-# --- Video editing ---
-moviepy>=1.0.3
+python-dotenv>=1.0.0
 
 # --- Speech recognition (subtitle generation) ---
 openai-whisper>=20231117

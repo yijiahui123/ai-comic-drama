@@ -5,13 +5,13 @@
 comfyui_models_root: ""
 
 style_lora:
-  enabled: false
+  enabled: true
   name: ""
   strength_model: 0.7
   strength_clip: 0.7
 
 character_loras:
-  enabled: false
+  enabled: true
   optional: true
 
 references:
@@ -28,3 +28,17 @@ continuity:
 voice:
   scene_level_tts: true
   fallback_per_shot_tts: true
+
+bgm:
+  enabled: false
+  directory: "assets/bgm"
+  volume: 0.15
+  fade_in: 2.0
+  fade_out: 3.0
+  mood_mapping:
+    happy: "upbeat.mp3"
+    sad: "melancholy.mp3"
+    angry: "intense.mp3"
+    neutral: "ambient.mp3"
+    tense: "suspense.mp3"
+    romantic: "gentle.mp3"

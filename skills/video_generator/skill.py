@@ -35,17 +35,21 @@ import yaml
 from utils import slugify as _slugify
 from utils.assets import load_asset_config
 from utils.logger import get_logger
+from utils.paths import PROJECT_ROOT
 from utils.validators import MAX_SHOT_DURATION_SECONDS
 
 logger = get_logger(__name__)
 
+
+from utils.comfyui import post_with_retry as _post_with_retry, poll_comfyui_ws as _poll_comfyui_ws
+
 _CONFIGS_DIR = Path(__file__).parent / "configs"
 
 # Output directories
-_OUTPUT_VIDEOS = Path("output/videos")
-_OUTPUT_AUDIO = Path("output/audio")
-_OUTPUT_LIPSYNC = Path("output/lipsync")
-_OUTPUT_CONTINUITY = Path("output/continuity")
+_OUTPUT_VIDEOS = PROJECT_ROOT / "output" / "videos"
+_OUTPUT_AUDIO = PROJECT_ROOT / "output" / "audio"
+_OUTPUT_LIPSYNC = PROJECT_ROOT / "output" / "lipsync"
+_OUTPUT_CONTINUITY = PROJECT_ROOT / "output" / "continuity"
 
 # Polling
 _POLL_INTERVAL = 5.0
@@ -101,21 +105,30 @@ class VideoGenerator:
         chattts_url: str = "http://localhost:9966",
         sadtalker_url: str = "http://localhost:7860",
         progress_callback: Optional[Callable[[str, int, int], None]] = None,
+        shot_progress_callback: Optional[Callable[[str, int, float, str], None]] = None,
+        chattts_enabled: bool = True,
+        sadtalker_enabled: bool = True,
     ) -> None:
         """
         Args:
             comfyui_url: ComfyUI server base URL.
             chattts_url: ChatTTS API server base URL.
             sadtalker_url: SadTalker Gradio server base URL.
+            shot_progress_callback: ``(shot_id, pct, eta_seconds, node)`` for per-shot progress.
+            chattts_enabled: If ``False``, skip voiceover entirely.
+            sadtalker_enabled: If ``False``, skip lip-sync entirely.
         """
         self.comfyui_url = comfyui_url.rstrip("/")
         self.chattts_url = chattts_url.rstrip("/")
         self.sadtalker_url = sadtalker_url.rstrip("/")
+        self._chattts_enabled = chattts_enabled
+        self._sadtalker_enabled = sadtalker_enabled
 
         self._video_config = self._load_yaml("video_config.yaml")
         self._voice_config = self._load_yaml("voice_config.yaml")
         self._asset_config = load_asset_config()
         self._progress_callback = progress_callback
+        self._shot_progress_callback = shot_progress_callback
         self._session: Optional[aiohttp.ClientSession] = None
 
         # Resolve mode-specific config
@@ -159,12 +172,16 @@ class VideoGenerator:
         _OUTPUT_LIPSYNC.mkdir(parents=True, exist_ok=True)
         _OUTPUT_CONTINUITY.mkdir(parents=True, exist_ok=True)
 
-        chattts_available = await self._check_service(self.chattts_url)
-        sadtalker_available = await self._check_service(self.sadtalker_url)
-
-        if not chattts_available:
+        chattts_available = self._chattts_enabled and await self._check_service(self.chattts_url)
+        if not self._chattts_enabled:
+            logger.info("ChatTTS disabled in config — voiceover will be skipped.")
+        elif not chattts_available:
             logger.warning("ChatTTS service unavailable — voiceover will be skipped.")
-        if not sadtalker_available:
+
+        sadtalker_available = self._sadtalker_enabled and await self._check_service(self.sadtalker_url)
+        if not self._sadtalker_enabled:
+            logger.info("SadTalker disabled in config — lip-sync will be skipped.")
+        elif not sadtalker_available:
             logger.warning("SadTalker service unavailable — lip-sync will be skipped.")
 
         video_paths: list[Path] = []
@@ -289,17 +306,18 @@ class VideoGenerator:
         session = self._get_session()
 
         try:
-            async with session.post(
-                f"{self.comfyui_url}/prompt", json=payload
-            ) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
-                prompt_id: str = data["prompt_id"]
+            data = await _post_with_retry(
+                session, f"{self.comfyui_url}/prompt", payload,
+            )
+            prompt_id: str = data["prompt_id"]
+        except (ConnectionError, TimeoutError) as exc:
+            logger.error("ComfyUI video submission failed for shot %s: %s", shot_id, exc)
+            return None
         except Exception as exc:  # noqa: BLE001
             logger.error("ComfyUI video submission failed for shot %s: %s", shot_id, exc)
             return None
 
-        video_bytes = await self._poll_video(prompt_id)
+        video_bytes = await self._poll_video(prompt_id, client_id, shot_id)
         if video_bytes:
             out_path.write_bytes(video_bytes)
             logger.info("Saved video: %s", out_path)
@@ -325,7 +343,7 @@ class VideoGenerator:
             str(out_path),
         ]
         try:
-            result = await asyncio.get_event_loop().run_in_executor(
+            result = await asyncio.get_running_loop().run_in_executor(
                 None,
                 lambda: subprocess.run(cmd, capture_output=True, text=True),
             )
@@ -346,12 +364,13 @@ class VideoGenerator:
         session = self._get_session()
         try:
             data = aiohttp.FormData()
-            data.add_field(
-                "image",
-                open(image_path, "rb"),
-                filename=image_path.name,
-                content_type="image/png",
-            )
+            with open(image_path, "rb") as fh:
+                data.add_field(
+                    "image",
+                    fh,
+                    filename=image_path.name,
+                    content_type="image/png",
+                )
             async with session.post(
                 f"{self.comfyui_url}/upload/image", data=data,
             ) as resp:
@@ -703,16 +722,42 @@ class VideoGenerator:
             },
         }
 
-    async def _poll_video(self, prompt_id: str) -> Optional[bytes]:
-        """Poll ComfyUI history until the video for *prompt_id* is ready.
+    async def _poll_video(self, prompt_id: str, client_id: str, shot_id: str = "") -> Optional[bytes]:
+        """Wait for ComfyUI to finish generating the video for *prompt_id*.
+
+        Uses WebSocket for real-time progress, falls back to HTTP polling.
 
         Args:
             prompt_id: ComfyUI prompt execution ID.
+            client_id: ComfyUI client UUID (must match submission).
+            shot_id: Shot identifier for progress reporting.
 
         Returns:
             Raw video bytes, or ``None`` on timeout.
         """
-        deadline = time.monotonic() + _POLL_TIMEOUT
+        t0 = time.monotonic()
+
+        # Try WebSocket for real-time progress
+        def _on_ws_progress(val: int, mx: int, node: str) -> None:
+            if mx > 0:
+                pct = int(val / mx * 100)
+                elapsed = time.monotonic() - t0
+                eta = (elapsed / val * (mx - val)) if val > 0 else 0
+                if self._progress_callback:
+                    self._progress_callback(
+                        f"生成中 {pct}% — 节点 {node or '...'} — ETA {int(eta)}s",
+                        val, mx,
+                    )
+                if self._shot_progress_callback and shot_id:
+                    self._shot_progress_callback(shot_id, pct, eta, node or "")
+
+        ws_done = await _poll_comfyui_ws(
+            self.comfyui_url, prompt_id, client_id,
+            timeout=_POLL_TIMEOUT, on_progress=_on_ws_progress,
+        )
+
+        # Fetch result via HTTP (whether WS succeeded or as fallback)
+        deadline = time.monotonic() + (0 if ws_done else _POLL_TIMEOUT)
         session = self._get_session()
         while time.monotonic() < deadline:
             await asyncio.sleep(_POLL_INTERVAL)
@@ -749,6 +794,26 @@ class VideoGenerator:
                     except Exception as exc:  # noqa: BLE001
                         logger.error("Failed to download video: %s", exc)
                         return None
+
+        # If WS said done but HTTP didn't find it, try once more
+        if ws_done:
+            try:
+                async with session.get(
+                    f"{self.comfyui_url}/history/{prompt_id}"
+                ) as resp:
+                    resp.raise_for_status()
+                    history = await resp.json()
+                    if prompt_id in history:
+                        for node_output in history[prompt_id].get("outputs", {}).values():
+                            gifs = node_output.get("videos", node_output.get("gifs", []))
+                            if gifs:
+                                info = gifs[0]
+                                params = {"filename": info["filename"], "subfolder": info.get("subfolder", ""), "type": info.get("type", "output")}
+                                async with session.get(f"{self.comfyui_url}/view", params=params) as resp2:
+                                    resp2.raise_for_status()
+                                    return await resp2.read()
+            except Exception:  # noqa: BLE001
+                pass
 
         logger.error("Video poll timed out after %.0fs", _POLL_TIMEOUT)
         return None

@@ -7,130 +7,419 @@
     <link rel="stylesheet" href="/web/styles.css" />
   </head>
   <body>
-    <main class="shell">
-      <section class="hero">
-        <div>
-          <p class="eyebrow">AI Comic Drama</p>
-          <h1>漫剧生成控制台</h1>
-          <p class="sub">输入剧情，监控生成阶段，预览资产和最终视频。</p>
-        </div>
-        <button id="validateAssets" class="secondary">检查资源配置</button>
-      </section>
-
-      <section class="panel create">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <p class="eyebrow">AI Comic Drama</p>
+        <h1>漫剧生成控制台</h1>
+      </div>
+      <div class="sidebar-actions">
+        <button id="refresh" class="ghost" style="flex:1">刷新</button>
+        <button id="validateAssets" class="ghost" style="flex:1">检查资源</button>
+      </div>
+      <div class="sidebar-prompt">
+        <label class="check" style="margin-bottom:6px;font-size:0.8rem">
+          <input id="batchMode" type="checkbox" />
+          批量模式（每行一个 prompt）
+        </label>
         <textarea id="prompt" placeholder="写一个 1 集赛博朋克漫剧，主角是黑客少女..."></textarea>
         <button id="start">开始生成</button>
-      </section>
+      </div>
+      <div id="projects" class="project-list"></div>
+      <div class="sidebar-footer">
+        <div id="assetsResult" class="notice"></div>
+      </div>
+    </aside>
 
-      <section class="grid">
-        <aside class="panel">
-          <div class="section-head">
-            <h2>项目</h2>
-            <button id="refresh" class="ghost">刷新</button>
+    <!-- Main content -->
+    <div class="main">
+      <nav class="tabs">
+        <div class="tab active" data-tab="overview">概览</div>
+        <div class="tab" data-tab="shots">镜头</div>
+        <div class="tab" data-tab="production">生产</div>
+        <div class="tab" data-tab="assets">资源</div>
+      </nav>
+
+      <div class="tab-content">
+        <!-- Overview tab -->
+        <div id="tab-overview" class="tab-panel active">
+          <div class="panel">
+            <div class="section-head">
+              <h2 id="projectTitle">未选择项目</h2>
+              <div class="actions">
+                <button data-rerun="ASSET_GEN" class="ghost rerun">重跑资产</button>
+                <button data-rerun="VIDEO_GEN" class="ghost rerun">重跑视频</button>
+                <button id="rerunFailed" class="ghost" style="display:none">重跑失败 Stage</button>
+                <button id="resume" class="ghost">恢复</button>
+              </div>
+            </div>
+            <div id="status" class="status"></div>
+            <div class="progress"><span id="progressBar"></span></div>
+            <pre id="log"></pre>
           </div>
-          <div id="projects" class="project-list"></div>
-        </aside>
 
-        <section class="panel detail">
-          <div class="section-head">
-            <h2 id="projectTitle">未选择项目</h2>
-            <div class="actions">
-              <button data-rerun="ASSET_GEN" class="ghost rerun">重跑资产</button>
-              <button data-rerun="VIDEO_GEN" class="ghost rerun">重跑视频</button>
-              <button id="resume" class="ghost">恢复</button>
+          <div class="panel">
+            <h2>预览</h2>
+            <div id="preview" class="preview"></div>
+          </div>
+        </div>
+
+        <!-- Shots tab -->
+        <div id="tab-shots" class="tab-panel">
+          <div class="grid-2">
+            <div class="panel">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+                <h3 style="margin:0">镜头列表</h3>
+                <select id="shotFilter" style="width:auto;font-size:0.8rem;padding:4px 8px">
+                  <option value="all">全部</option>
+                  <option value="failed">失败</option>
+                  <option value="needs_review">待审</option>
+                  <option value="ready">就绪</option>
+                  <option value="pending">待处理</option>
+                </select>
+              </div>
+              <div id="shotsList" class="shots-list"></div>
+            </div>
+            <div>
+              <form id="shotEditForm" class="asset-form">
+                <h3>镜头编辑</h3>
+                <label>
+                  shot_id
+                  <input id="editShotId" readonly />
+                </label>
+                <label>
+                  画面描述 visual_prompt
+                  <textarea id="editVisualPrompt" class="mini-yaml"></textarea>
+                </label>
+                <label>
+                  动作 motion_prompt
+                  <textarea id="editMotionPrompt" class="mini-yaml"></textarea>
+                </label>
+                <label>
+                  对白 dialogue
+                  <textarea id="editDialogue" class="mini-yaml"></textarea>
+                </label>
+                <div class="form-grid">
+                  <label>
+                    情绪 emotion
+                    <input id="editEmotion" />
+                  </label>
+                  <label>
+                    时长 duration
+                    <input id="editDuration" type="number" min="0.5" max="5" step="0.5" />
+                  </label>
+                </div>
+                <div class="actions">
+                  <button type="submit">保存镜头</button>
+                  <button id="lockShot" type="button" class="ghost">锁定</button>
+                  <button id="unlockShot" type="button" class="ghost">解锁</button>
+                  <button id="qualityShot" type="button" class="ghost">质检</button>
+                </div>
+                <div class="actions">
+                  <button id="approveShot" type="button" class="ghost">审核通过</button>
+                  <button id="rejectShot" type="button" class="ghost">驳回</button>
+                  <button id="needsRetryShot" type="button" class="ghost">需要重试</button>
+                </div>
+                <div id="shotQualityDetail" class="shot-quality-detail"></div>
+              </form>
+
+              <div class="panel" style="margin-top:16px">
+                <h3>审核队列</h3>
+                <div id="reviewQueue" class="compact-list"></div>
+              </div>
             </div>
           </div>
-          <div id="status" class="status"></div>
-          <div class="progress"><span id="progressBar"></span></div>
-          <pre id="log"></pre>
-          <div id="assetsResult" class="notice"></div>
-        </section>
-      </section>
+        </div>
 
-      <section class="panel">
-        <h2>预览</h2>
-        <div id="preview" class="preview"></div>
-      </section>
+        <!-- Production tab -->
+        <div id="tab-production" class="tab-panel">
+          <div class="panel">
+            <div class="section-head">
+              <div>
+                <h2>工业闭环</h2>
+                <p class="sub">队列、健康检查、质检、重试和导出。默认不启动真实模型。</p>
+              </div>
+              <div class="actions">
+                <button id="refreshProduction" class="ghost">刷新</button>
+                <button id="runHealth" class="ghost">健康检查</button>
+              </div>
+            </div>
 
-      <section class="panel library">
-        <div class="section-head">
-          <div>
-            <h2>资源库</h2>
-            <p class="sub">上传角色/表情/场景/分镜资源，或直接编辑 manifest 与资产配置。</p>
+            <div class="grid-2">
+              <div>
+                <h3>任务队列</h3>
+                <div id="queueList" class="compact-list"></div>
+              </div>
+              <div>
+                <h3>环境健康</h3>
+                <div id="healthList" class="compact-list"></div>
+              </div>
+            </div>
+
+            <div class="actions">
+              <button id="qualityProject" class="ghost">全项目质检</button>
+              <button id="retryFailed" class="ghost">重试失败镜头</button>
+              <button id="exportProject" class="ghost">生成导出包</button>
+              <button id="downloadExport" class="ghost">下载导出包</button>
+            </div>
+
+            <div style="margin-top:16px">
+              <h3>质检报告</h3>
+              <div id="qualityReport"></div>
+            </div>
           </div>
-          <button id="loadAssets" class="ghost">载入资源库</button>
+
+          <div class="panel">
+            <h3>Stage 管理</h3>
+            <div class="tool-row">
+              <label>
+                Stage 清理/标记重生成
+                <select id="cleanupStage">
+                  <option value="ASSET_GEN">ASSET_GEN</option>
+                  <option value="VIDEO_GEN">VIDEO_GEN</option>
+                  <option value="EDITING">EDITING</option>
+                  <option value="SCRIPTING">SCRIPTING</option>
+                </select>
+              </label>
+              <button id="cleanupStageBtn" class="ghost">只清理并标记</button>
+              <button id="forceRerunStageBtn" class="ghost">清理后立即重跑</button>
+            </div>
+            <div class="tool-row">
+              <label>
+                单镜头 shot_id
+                <input id="shotId" placeholder="S01E01-001" />
+              </label>
+              <label class="check">
+                <input id="shotIncludeAsset" type="checkbox" checked />
+                同时删除分镜图
+              </label>
+              <button id="cleanupShotBtn" class="ghost">清理镜头</button>
+              <button id="markShotRerunBtn" class="ghost">标记镜头重生成</button>
+            </div>
+          </div>
         </div>
 
-        <div class="library-grid">
-          <form id="uploadForm" class="asset-form">
-            <label>
-              类型
-              <select id="assetType">
-                <option value="character_reference">角色参考图</option>
-                <option value="character_expression">角色表情图</option>
-                <option value="scene">场景图</option>
-                <option value="shot">分镜图</option>
-              </select>
-            </label>
-            <label>
-              Key（角色名 / scene_id / shot_id）
-              <input id="assetKey" placeholder="凯 或 S01E01 或 S01E01-001" />
-            </label>
-            <label>
-              表情（仅角色表情图）
-              <select id="assetEmotion">
-                <option value="neutral">neutral</option>
-                <option value="happy">happy</option>
-                <option value="sad">sad</option>
-                <option value="angry">angry</option>
-                <option value="surprised">surprised</option>
-              </select>
-            </label>
-            <label>
-              图片文件
-              <input id="assetFile" type="file" accept=".png,.jpg,.jpeg,.webp,image/*" />
-            </label>
-            <button type="submit">上传并写入 manifest</button>
-          </form>
+        <!-- Assets tab -->
+        <div id="tab-assets" class="tab-panel">
+          <div class="panel">
+            <div class="section-head">
+              <h2>资源库</h2>
+              <button id="loadAssets" class="ghost">载入资源库</button>
+            </div>
 
-          <form id="loraForm" class="asset-form">
-            <h3>角色 LoRA（可选）</h3>
-            <label>
-              角色名
-              <input id="loraCharacter" placeholder="凯" />
-            </label>
-            <label class="check">
-              <input id="loraEnabled" type="checkbox" />
-              启用该角色 LoRA
-            </label>
-            <label>
-              LoRA 文件名
-              <input id="loraName" placeholder="kai_v1.safetensors" />
-            </label>
-            <label>
-              Trigger
-              <input id="loraTrigger" placeholder="kai_person" />
-            </label>
-            <button type="submit">保存 LoRA 映射</button>
-          </form>
-        </div>
+            <div class="grid-2">
+              <form id="uploadForm" class="asset-form">
+                <h3>上传资源</h3>
+                <label>
+                  类型
+                  <select id="assetType">
+                    <option value="character_reference">角色参考图</option>
+                    <option value="character_expression">角色表情图</option>
+                    <option value="scene">场景图</option>
+                    <option value="shot">分镜图</option>
+                  </select>
+                </label>
+                <label>
+                  Key（角色名 / scene_id / shot_id）
+                  <input id="assetKey" placeholder="凯 或 S01E01 或 S01E01-001" />
+                </label>
+                <label>
+                  表情（仅角色表情图）
+                  <select id="assetEmotion">
+                    <option value="neutral">neutral</option>
+                    <option value="happy">happy</option>
+                    <option value="sad">sad</option>
+                    <option value="angry">angry</option>
+                    <option value="surprised">surprised</option>
+                  </select>
+                </label>
+                <label>
+                  图片文件
+                  <input id="assetFile" type="file" accept=".png,.jpg,.jpeg,.webp,image/*" />
+                </label>
+                <button type="submit">上传并写入 manifest</button>
+              </form>
 
-        <div class="yaml-grid">
-          <label>
-            manifest.yaml
-            <textarea id="manifestYaml" class="yaml"></textarea>
-          </label>
-          <label>
-            configs/assets.yaml
-            <textarea id="configYaml" class="yaml"></textarea>
-          </label>
+              <form id="deleteBindingForm" class="asset-form">
+                <h3>删除 manifest 绑定</h3>
+                <label>
+                  类型
+                  <select id="deleteAssetType">
+                    <option value="character_reference">角色参考图</option>
+                    <option value="character_expression">角色表情图</option>
+                    <option value="character_lora">角色 LoRA 映射</option>
+                    <option value="character">整个角色绑定</option>
+                    <option value="scene">场景图</option>
+                    <option value="shot">分镜图</option>
+                    <option value="scene_audio">场景音频切分</option>
+                  </select>
+                </label>
+                <label>
+                  Key
+                  <input id="deleteKey" placeholder="凯 或 S01E01-001" />
+                </label>
+                <label>
+                  表情（仅角色表情图）
+                  <select id="deleteEmotion">
+                    <option value="neutral">neutral</option>
+                    <option value="happy">happy</option>
+                    <option value="sad">sad</option>
+                    <option value="angry">angry</option>
+                    <option value="surprised">surprised</option>
+                  </select>
+                </label>
+                <label class="check">
+                  <input id="deletePhysicalFile" type="checkbox" />
+                  同时删除资源文件
+                </label>
+                <button type="submit">删除绑定</button>
+              </form>
+            </div>
+
+            <div class="grid-2" style="margin-top:16px">
+              <form id="loraForm" class="asset-form">
+                <h3>角色 LoRA（可选）</h3>
+                <label>
+                  角色名
+                  <input id="loraCharacter" placeholder="凯" />
+                </label>
+                <label class="check">
+                  <input id="loraEnabled" type="checkbox" />
+                  启用该角色 LoRA
+                </label>
+                <label>
+                  LoRA 文件名
+                  <input id="loraName" placeholder="kai_v1.safetensors" />
+                </label>
+                <label>
+                  Trigger
+                  <input id="loraTrigger" placeholder="kai_person" />
+                </label>
+                <div class="form-grid">
+                  <label>
+                    strength_model
+                    <input id="loraStrengthModel" type="number" min="0" max="2" step="0.05" value="0.85" />
+                  </label>
+                  <label>
+                    strength_clip
+                    <input id="loraStrengthClip" type="number" min="0" max="2" step="0.05" value="0.8" />
+                  </label>
+                </div>
+                <button type="submit">保存 LoRA 映射</button>
+              </form>
+
+              <form id="sceneAudioForm" class="asset-form">
+                <h3>场景级 TTS 切分数据</h3>
+                <label>
+                  scene_id
+                  <input id="sceneAudioId" placeholder="S01E01" />
+                </label>
+                <label>
+                  场景音频路径
+                  <input id="sceneAudioPath" placeholder="output/audio/s01e01_scene.wav" />
+                </label>
+                <label>
+                  segments JSON
+                  <textarea id="sceneAudioSegments" class="mini-yaml" placeholder='[{"shot_id":"S01E01-001","start":0,"end":4.2,"text":"..."}]'></textarea>
+                </label>
+                <button type="submit">保存切分数据</button>
+              </form>
+            </div>
+          </div>
+
+          <div class="panel">
+            <h3>资产配置</h3>
+            <form id="configForm" class="asset-form">
+              <div class="grid-3">
+                <label>
+                  ComfyUI models 路径
+                  <input id="cfgComfyRoot" placeholder="/path/to/ComfyUI/models" />
+                </label>
+                <label>
+                  Style LoRA 文件名
+                  <input id="cfgStyleName" placeholder="comic_style.safetensors" />
+                </label>
+                <label class="check">
+                  <input id="cfgStyleEnabled" type="checkbox" />
+                  启用 Style LoRA
+                </label>
+                <label>
+                  Style strength_model
+                  <input id="cfgStyleStrengthModel" type="number" min="0" max="2" step="0.05" />
+                </label>
+                <label>
+                  Style strength_clip
+                  <input id="cfgStyleStrengthClip" type="number" min="0" max="2" step="0.05" />
+                </label>
+                <label class="check">
+                  <input id="cfgCharacterLorasEnabled" type="checkbox" />
+                  启用角色 LoRA 总开关
+                </label>
+                <label class="check">
+                  <input id="cfgCharacterLorasOptional" type="checkbox" />
+                  角色 LoRA 缺失时只警告
+                </label>
+                <label class="check">
+                  <input id="cfgPreferLibrary" type="checkbox" />
+                  优先使用资源库
+                </label>
+                <label class="check">
+                  <input id="cfgGenerateMissing" type="checkbox" />
+                  缺失资源自动生成
+                </label>
+                <label class="check">
+                  <input id="cfgUseCharRef" type="checkbox" />
+                  分镜使用角色参考图
+                </label>
+                <label class="check">
+                  <input id="cfgUseExprRef" type="checkbox" />
+                  分镜使用表情参考图
+                </label>
+                <label>
+                  单次视频最大秒数
+                  <input id="cfgMaxDuration" type="number" min="1" max="5" step="0.5" />
+                </label>
+                <label class="check">
+                  <input id="cfgSplitLongActions" type="checkbox" />
+                  长动作拆分
+                </label>
+                <label class="check">
+                  <input id="cfgUseTailFrame" type="checkbox" />
+                  使用上一段尾帧接续
+                </label>
+                <label class="check">
+                  <input id="cfgSceneTts" type="checkbox" />
+                  场景级 TTS
+                </label>
+                <label class="check">
+                  <input id="cfgFallbackShotTts" type="checkbox" />
+                  失败回退单镜头 TTS
+                </label>
+              </div>
+              <button type="submit">保存表单配置</button>
+            </form>
+          </div>
+
+          <div class="panel">
+            <h3>YAML 编辑器</h3>
+            <div class="grid-2">
+              <label>
+                manifest.yaml
+                <textarea id="manifestYaml" class="yaml"></textarea>
+              </label>
+              <label>
+                configs/assets.yaml
+                <textarea id="configYaml" class="yaml"></textarea>
+              </label>
+            </div>
+            <div class="actions">
+              <button id="saveManifest" class="ghost">保存 manifest</button>
+              <button id="saveConfig" class="ghost">保存配置</button>
+            </div>
+          </div>
         </div>
-        <div class="actions">
-          <button id="saveManifest" class="secondary">保存 manifest</button>
-          <button id="saveConfig" class="secondary">保存配置</button>
-        </div>
-      </section>
-    </main>
+      </div>
+    </div>
     <script src="/web/app.js"></script>
   </body>
 </html>
