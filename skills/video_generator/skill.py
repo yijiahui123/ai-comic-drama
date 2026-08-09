@@ -41,7 +41,8 @@ from utils.validators import MAX_SHOT_DURATION_SECONDS
 logger = get_logger(__name__)
 
 
-from utils.comfyui import post_with_retry as _post_with_retry, poll_comfyui_ws as _poll_comfyui_ws
+from utils.http_client import HTTPClient
+from utils.comfyui import poll_comfyui_ws as _poll_comfyui_ws
 
 _CONFIGS_DIR = Path(__file__).parent / "configs"
 
@@ -129,7 +130,9 @@ class VideoGenerator:
         self._asset_config = load_asset_config()
         self._progress_callback = progress_callback
         self._shot_progress_callback = shot_progress_callback
-        self._session: Optional[aiohttp.ClientSession] = None
+        self._client_comfy: Optional[HTTPClient] = None
+        self._client_chattts: Optional[HTTPClient] = None
+        self._client_sadtalker: Optional[HTTPClient] = None
 
         # Resolve mode-specific config
         mode = self._video_config.get("mode", "5b_single")
@@ -144,14 +147,18 @@ class VideoGenerator:
     # ------------------------------------------------------------------
 
     async def __aenter__(self) -> "VideoGenerator":
-        self._session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=60, connect=10)
-        )
+        self._get_comfy_client()
+        self._get_chattts_client()
+        self._get_sadtalker_client()
+        if self._client_comfy: await self._client_comfy.__aenter__()
+        if self._client_chattts: await self._client_chattts.__aenter__()
+        if self._client_sadtalker: await self._client_sadtalker.__aenter__()
         return self
 
     async def __aexit__(self, *_: Any) -> None:
-        if self._session and not self._session.closed:
-            await self._session.close()
+        if self._client_comfy: await self._client_comfy.__aexit__()
+        if self._client_chattts: await self._client_chattts.__aexit__()
+        if self._client_sadtalker: await self._client_sadtalker.__aexit__()
 
     # ------------------------------------------------------------------
     # Public API
@@ -303,17 +310,12 @@ class VideoGenerator:
 
         client_id = str(uuid.uuid4())
         payload = {"prompt": workflow, "client_id": client_id}
-        session = self._get_session()
+        client = self._get_comfy_client()
 
         try:
-            data = await _post_with_retry(
-                session, f"{self.comfyui_url}/prompt", payload,
-            )
+            data = await client.post("/prompt", json=payload)
             prompt_id: str = data["prompt_id"]
-        except (ConnectionError, TimeoutError) as exc:
-            logger.error("ComfyUI video submission failed for shot %s: %s", shot_id, exc)
-            return None
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.error("ComfyUI video submission failed for shot %s: %s", shot_id, exc)
             return None
 
@@ -361,7 +363,7 @@ class VideoGenerator:
         Returns:
             The filename assigned by ComfyUI, or ``None`` on failure.
         """
-        session = self._get_session()
+        client = self._get_comfy_client()
         try:
             data = aiohttp.FormData()
             with open(image_path, "rb") as fh:
@@ -371,12 +373,8 @@ class VideoGenerator:
                     filename=image_path.name,
                     content_type="image/png",
                 )
-            async with session.post(
-                f"{self.comfyui_url}/upload/image", data=data,
-            ) as resp:
-                resp.raise_for_status()
-                result = await resp.json()
-                return result.get("name")
+            result = await client.post("/upload/image", data=data)
+            return result.get("name")
         except Exception as exc:  # noqa: BLE001
             logger.error("Failed to upload image %s: %s", image_path, exc)
             return None
@@ -758,16 +756,12 @@ class VideoGenerator:
 
         # Fetch result via HTTP (whether WS succeeded or as fallback)
         deadline = time.monotonic() + (0 if ws_done else _POLL_TIMEOUT)
-        session = self._get_session()
+        client = self._get_comfy_client()
         while time.monotonic() < deadline:
             await asyncio.sleep(_POLL_INTERVAL)
             try:
-                async with session.get(
-                    f"{self.comfyui_url}/history/{prompt_id}"
-                ) as resp:
-                    resp.raise_for_status()
-                    history = await resp.json()
-            except Exception as exc:  # noqa: BLE001
+                history = await client.get(f"/history/{prompt_id}")
+            except Exception as exc:
                 logger.warning("History poll error: %s", exc)
                 continue
 
@@ -786,33 +780,23 @@ class VideoGenerator:
                         "type": info.get("type", "output"),
                     }
                     try:
-                        async with session.get(
-                            f"{self.comfyui_url}/view", params=params
-                        ) as resp:
-                            resp.raise_for_status()
-                            return await resp.read()
-                    except Exception as exc:  # noqa: BLE001
+                        return await client.get("/view", parse_json=False, params=params)
+                    except Exception as exc:
                         logger.error("Failed to download video: %s", exc)
                         return None
 
         # If WS said done but HTTP didn't find it, try once more
         if ws_done:
             try:
-                async with session.get(
-                    f"{self.comfyui_url}/history/{prompt_id}"
-                ) as resp:
-                    resp.raise_for_status()
-                    history = await resp.json()
-                    if prompt_id in history:
-                        for node_output in history[prompt_id].get("outputs", {}).values():
-                            gifs = node_output.get("videos", node_output.get("gifs", []))
-                            if gifs:
-                                info = gifs[0]
-                                params = {"filename": info["filename"], "subfolder": info.get("subfolder", ""), "type": info.get("type", "output")}
-                                async with session.get(f"{self.comfyui_url}/view", params=params) as resp2:
-                                    resp2.raise_for_status()
-                                    return await resp2.read()
-            except Exception:  # noqa: BLE001
+                history = await client.get(f"/history/{prompt_id}")
+                if prompt_id in history:
+                    for node_output in history[prompt_id].get("outputs", {}).values():
+                        gifs = node_output.get("videos", node_output.get("gifs", []))
+                        if gifs:
+                            info = gifs[0]
+                            params = {"filename": info["filename"], "subfolder": info.get("subfolder", ""), "type": info.get("type", "output")}
+                            return await client.get("/view", parse_json=False, params=params)
+            except Exception:
                 pass
 
         logger.error("Video poll timed out after %.0fs", _POLL_TIMEOUT)
@@ -843,25 +827,18 @@ class VideoGenerator:
             "speed": self._voice_config.get("speed", 1.0),
             "temperature": self._voice_config.get("temperature", 0.3),
         }
-        session = self._get_session()
+        client = self._get_chattts_client()
         out_path = _OUTPUT_AUDIO / f"{shot_id}.wav"
 
-        for attempt in range(1, 4):
-            try:
-                async with session.post(
-                    f"{self.chattts_url}/generate_audio", json=payload
-                ) as resp:
-                    resp.raise_for_status()
-                    data = await resp.json()
-                    audio_b64 = data.get("audio_base64", "")
-                    if audio_b64:
-                        out_path.write_bytes(base64.b64decode(audio_b64))
-                        logger.info("Saved audio: %s", out_path)
-                        return out_path
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("ChatTTS attempt %d failed for shot %s: %s", attempt, shot_id, exc)
-                if attempt < 3:
-                    await asyncio.sleep(2.0 * attempt)
+        try:
+            data = await client.post("/generate_audio", json=payload)
+            audio_b64 = data.get("audio_base64", "")
+            if audio_b64:
+                out_path.write_bytes(base64.b64decode(audio_b64))
+                logger.info("Saved audio: %s", out_path)
+                return out_path
+        except Exception as exc:
+            logger.warning("ChatTTS failed for shot %s: %s", shot_id, exc)
 
         logger.error("Audio generation failed for shot %s", shot_id)
         return None
@@ -908,7 +885,7 @@ class VideoGenerator:
             Path to the lip-synced video, or ``None`` on failure.
         """
         out_path = _OUTPUT_LIPSYNC / f"{shot_id}_lipsync.mp4"
-        session = self._get_session()
+        client = self._get_sadtalker_client()
 
         video_b64 = base64.b64encode(video_path.read_bytes()).decode()
         audio_b64 = base64.b64encode(audio_path.read_bytes()).decode()
@@ -918,46 +895,39 @@ class VideoGenerator:
             "audio_base64": audio_b64,
         }
 
-        for attempt in range(1, 4):
-            try:
-                async with session.post(
-                    f"{self.sadtalker_url}/api/lipsync", json=payload,
-                    timeout=aiohttp.ClientTimeout(total=300),
-                ) as resp:
-                    resp.raise_for_status()
-                    data = await resp.json()
-                    result_b64 = data.get("video_base64", "")
-                    if result_b64:
-                        out_path.write_bytes(base64.b64decode(result_b64))
-                        logger.info("Saved lipsync video: %s", out_path)
-                        return out_path
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "SadTalker attempt %d failed for shot %s: %s", attempt, shot_id, exc
-                )
-                if attempt < 3:
-                    await asyncio.sleep(3.0 * attempt)
+        try:
+            data = await client.post("/api/lipsync", json=payload)
+            result_b64 = data.get("video_base64", "")
+            if result_b64:
+                out_path.write_bytes(base64.b64decode(result_b64))
+                logger.info("Saved lipsync video: %s", out_path)
+                return out_path
+        except Exception as exc:
+            logger.warning("SadTalker failed for shot %s: %s", shot_id, exc)
 
         logger.error("Lip-sync failed for shot %s", shot_id)
         return None
 
     async def _check_service(self, base_url: str) -> bool:
         """Return ``True`` if the service at *base_url* is reachable."""
-        session = self._get_session()
-        try:
-            async with session.get(
-                base_url, timeout=aiohttp.ClientTimeout(total=5)
-            ) as resp:
-                return resp.status < 500
-        except Exception:  # noqa: BLE001
-            return False
+        # Use a temporary HTTPClient for the raw URL to check health
+        temp_client = HTTPClient(base_url, timeout=aiohttp.ClientTimeout(total=5))
+        return await temp_client.health_check()
 
-    def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=60, connect=10)
-            )
-        return self._session
+    def _get_comfy_client(self) -> HTTPClient:
+        if self._client_comfy is None:
+            self._client_comfy = HTTPClient(self.comfyui_url, timeout=aiohttp.ClientTimeout(total=60, connect=10))
+        return self._client_comfy
+
+    def _get_chattts_client(self) -> HTTPClient:
+        if self._client_chattts is None:
+            self._client_chattts = HTTPClient(self.chattts_url, timeout=aiohttp.ClientTimeout(total=60, connect=10))
+        return self._client_chattts
+
+    def _get_sadtalker_client(self) -> HTTPClient:
+        if self._client_sadtalker is None:
+            self._client_sadtalker = HTTPClient(self.sadtalker_url, timeout=aiohttp.ClientTimeout(total=300, connect=10))
+        return self._client_sadtalker
 
     @staticmethod
     def _load_yaml(filename: str) -> dict[str, Any]:

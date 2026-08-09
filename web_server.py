@@ -42,29 +42,29 @@ from utils.logger import get_logger
 from utils.production import (
     build_shot_states,
     export_project,
+    final_video_paths,
     mark_failed_for_retry,
     quality_check_project,
     quality_check_shot,
     review_shot,
+    set_shot_status,
     set_shot_lock,
     update_script_shot,
 )
 
 from utils.paths import PROJECT_ROOT
+from utils.queue_db import queue_db
+from utils.concurrency import with_pipeline_lock
 
 logger = get_logger("web_server")
 
 ROOT = PROJECT_ROOT
 WEB_DIR = ROOT / "web"
 STATE_DIR = ROOT / "output" / "state"
-QUEUE_STATE_PATH = ROOT / "output" / "queue_state.json"
 
 app = FastAPI(title="AI Comic Drama Console")
-_tasks: dict[str, asyncio.Task] = {}
-_queue_records: dict[str, dict[str, Any]] = {}
-_queue_order: list[str] = []
 _queue_runner: asyncio.Task | None = None
-_queued_work: asyncio.Queue[str] | None = None
+_pending_queue_ids: list[str] = []
 _active_queue_task_id: str | None = None
 
 ENABLE_MODEL_TASKS = os.getenv("AI_COMIC_ENABLE_MODEL_TASKS", "0") == "1"
@@ -73,6 +73,7 @@ _RUNNER_MAP = {
     "create_project": "_model_task_runner",
     "resume_project": "_model_task_runner",
     "rerun_stage": "_model_task_runner",
+    "rerun_shot": "_model_task_runner",
     "retry_failed_shots": "_model_task_runner",
     "export_project": "_export_task_runner",
 }
@@ -80,37 +81,9 @@ _RUNNER_MAP = {
 _RUNNER_FUNCS: dict[str, Any] = {}
 
 
-def _save_queue() -> None:
-    QUEUE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    records = {
-        tid: {k: v for k, v in rec.items() if k != "runner"}
-        for tid, rec in _queue_records.items()
-    }
-    data = {"records": records, "order": _queue_order}
-    QUEUE_STATE_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
 def _load_queue() -> None:
-    global _queue_records, _queue_order
-    if not QUEUE_STATE_PATH.exists():
-        return
-    try:
-        data = json.loads(QUEUE_STATE_PATH.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return
-    records = data.get("records", {})
-    order = data.get("order", [])
-    runner_name_map = _RUNNER_MAP
-    for tid, rec in records.items():
-        kind = rec.get("kind", "")
-        runner_name = runner_name_map.get(kind, "")
-        rec["runner"] = _RUNNER_FUNCS.get(runner_name) or _model_task_runner
-        # Reset queued/running tasks to queued so they can be re-processed
-        if rec.get("status") in ("queued", "running"):
-            rec["status"] = "queued"
-            rec["message"] = "Restored after restart"
-    _queue_records = records
-    _queue_order = [tid for tid in order if tid in records]
+    for task in queue_db.get_pending_tasks():
+        _pending_queue_ids.append(task["task_id"])
 
 
 class CreateProjectRequest(BaseModel):
@@ -194,36 +167,33 @@ def _save_state(state: PipelineState) -> None:
 
 
 def _task_record(task_id: str, status: str, message: str = "", **updates: Any) -> dict[str, Any]:
-    record = _queue_records[task_id]
-    record.update(
-        {
-            "status": status,
-            "message": message,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-            **updates,
-        }
-    )
-    _save_queue()
+    queue_db.update_task_status(task_id, status, message)
+    record = queue_db.get_task(task_id) or {}
+    record.update(updates)
     return record
 
 
-def _ensure_queue() -> asyncio.Queue[str]:
-    global _queued_work
-    if _queued_work is None:
-        _queued_work = asyncio.Queue()
-    return _queued_work
+def _ensure_queue_worker() -> None:
+    """Start a worker on the current event loop if queued work exists."""
+    global _queue_runner
+    if not _pending_queue_ids:
+        return
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if _queue_runner is None or _queue_runner.done():
+        _queue_runner = running_loop.create_task(_queue_worker())
 
 
 async def _queue_worker() -> None:
     global _active_queue_task_id
-    queue = _ensure_queue()
-    while True:
-        task_id = await queue.get()
+    while _pending_queue_ids:
+        task_id = _pending_queue_ids.pop(0)
         _active_queue_task_id = task_id
-        record = _queue_records.get(task_id)
+        record = queue_db.get_task(task_id)
         if not record or record.get("status") == "canceled":
             _active_queue_task_id = None
-            queue.task_done()
             continue
         _task_record(task_id, "running", "Task started")
         project_id = record.get("project_id")
@@ -234,7 +204,8 @@ async def _queue_worker() -> None:
                 state.update_progress(f"Queue task {record['kind']} started", event_type="queue")
                 state.save()
 
-            runner = record.get("runner")
+            runner_name = _RUNNER_MAP.get(record.get("kind", ""))
+            runner = _RUNNER_FUNCS.get(runner_name)
             result = await runner(record) if runner else None
 
             if state:
@@ -266,42 +237,23 @@ async def _queue_worker() -> None:
             _task_record(task_id, "failed", str(exc), error=str(exc))
         finally:
             _active_queue_task_id = None
-            queue.task_done()
+            await asyncio.sleep(0)
 
 
 def _enqueue(kind: str, project_id: str | None, payload: dict[str, Any], runner) -> dict[str, Any]:
     global _queue_runner
     task_id = uuid.uuid4().hex[:10]
-    now = datetime.now(timezone.utc).isoformat()
-    _queue_records[task_id] = {
-        "task_id": task_id,
-        "kind": kind,
-        "project_id": project_id,
-        "payload": payload,
-        "status": "queued",
-        "message": "Queued",
-        "created_at": now,
-        "updated_at": now,
-        "runner": runner,
-    }
-    _queue_order.append(task_id)
-    # Calculate queue position
-    queued_before = sum(
-        1 for tid in _queue_order
-        if _queue_records.get(tid, {}).get("status") == "queued"
-        and tid != task_id
-    )
-    _queue_records[task_id]["queue_position"] = queued_before + 1
+    queue_db.add_task(task_id, kind, project_id, payload)
+    
     if project_id:
         state = _load_state(project_id)
         state.queue_status = "queued"
-        state.update_progress(f"Queue task {kind} queued (position {queued_before + 1})", event_type="queue")
+        state.update_progress(f"Queue task {kind} queued", event_type="queue")
         state.save()
-    _ensure_queue().put_nowait(task_id)
-    if _queue_runner is None or _queue_runner.done():
-        _queue_runner = asyncio.create_task(_queue_worker())
-    _save_queue()
-    return {k: v for k, v in _queue_records[task_id].items() if k != "runner"}
+        
+    _pending_queue_ids.append(task_id)
+    _ensure_queue_worker()
+    return queue_db.get_task(task_id) or {}
 
 
 async def _model_task_runner(record: dict[str, Any]) -> dict[str, Any]:
@@ -315,7 +267,7 @@ async def _model_task_runner(record: dict[str, Any]) -> dict[str, Any]:
         state.save()
         return {"model_execution": "disabled"}
     orchestrator = PipelineOrchestrator.resume(project_id)
-    await orchestrator.run()
+    await with_pipeline_lock(orchestrator.run())
     return {"model_execution": "completed"}
 
 
@@ -452,8 +404,7 @@ def _stage_cleanup_paths(state: PipelineState, stage: Stage) -> list[str | Path]
         for scene_id in _script_scene_ids(state):
             paths.append(ROOT / "output" / "audio" / f"{slugify(scene_id)}_scene.wav")
     if stage in (Stage.SCRIPTING, Stage.ASSET_GEN, Stage.VIDEO_GEN, Stage.EDITING):
-        if state.final_video:
-            paths.append(state.final_video)
+        paths.extend(final_video_paths(state))
         paths.extend((ROOT / "output" / "final").glob(f"{state.project_id}*.mp4"))
     return list(dict.fromkeys(paths))
 
@@ -516,9 +467,7 @@ def _cleanup_shot_state(state: PipelineState, shot_id: str, include_asset: bool)
     state.final_video = None
     if shot_id in state.shot_states:
         shot_state = state.shot_states[shot_id]
-        shot_state.status = "pending"
-        shot_state.review_status = "pending"
-        shot_state.last_error = None
+        set_shot_status(shot_state, "pending", "pending")
         for key in ("video", "audio", "lipsync"):
             shot_state.outputs[key] = ""
         if include_asset:
@@ -527,25 +476,7 @@ def _cleanup_shot_state(state: PipelineState, shot_id: str, include_asset: bool)
     state.save()
 
 
-async def _run_project(orchestrator: PipelineOrchestrator) -> None:
-    project_id = orchestrator.state.project_id
-    try:
-        await orchestrator.run()
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Project %s failed: %s", project_id, exc)
-        orchestrator.state.current_stage = Stage.ERROR
-        orchestrator.state.update_progress(f"Unhandled error: {exc}", event_type="stage_error")
-        orchestrator.state.save()
-    finally:
-        _tasks.pop(project_id, None)
-
-
-def _start_background(orchestrator: PipelineOrchestrator) -> None:
-    project_id = orchestrator.state.project_id
-    existing = _tasks.get(project_id)
-    if existing and not existing.done():
-        return
-    _tasks[project_id] = asyncio.create_task(_run_project(orchestrator))
+    pass
 
 
 @app.on_event("startup")
@@ -556,12 +487,8 @@ async def _startup() -> None:
     _RUNNER_FUNCS["_export_task_runner"] = _export_task_runner
     _load_queue()
     # Restart queue worker if there are pending tasks
-    if any(rec.get("status") == "queued" for rec in _queue_records.values()):
-        for tid in _queue_order:
-            if _queue_records.get(tid, {}).get("status") == "queued":
-                _ensure_queue().put_nowait(tid)
-        global _queue_runner
-        _queue_runner = asyncio.create_task(_queue_worker())
+    if _pending_queue_ids:
+        _ensure_queue_worker()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -631,7 +558,7 @@ async def list_projects() -> list[dict[str, Any]]:
                 continue
             build_shot_states(state)
             data = _state_to_dict(state)
-            data["running"] = path.stem in _tasks and not _tasks[path.stem].done()
+            data["running"] = queue_db.is_project_running(path.stem)
             projects.append(data)
     return projects
 
@@ -642,14 +569,13 @@ async def get_project(project_id: str) -> dict[str, Any]:
     build_shot_states(state)
     state.save()
     data = _state_to_dict(state)
-    data["running"] = project_id in _tasks and not _tasks[project_id].done()
+    data["running"] = queue_db.is_project_running(project_id)
     return data
 
 
 @app.delete("/api/projects/{project_id}")
 async def delete_project(project_id: str) -> dict[str, Any]:
-    existing = _tasks.get(project_id)
-    if existing and not existing.done():
+    if queue_db.is_project_running(project_id):
         raise HTTPException(status_code=409, detail="Project is running, cancel it first")
     state_path = STATE_DIR / f"{project_id}.json"
     if not state_path.exists():
@@ -657,33 +583,23 @@ async def delete_project(project_id: str) -> dict[str, Any]:
     # Clean up output files
     deleted_files: list[str] = []
     try:
-        state = _load_state(project_id)
+        state = PipelineState.model_validate(json.loads(state_path.read_text(encoding="utf-8")))
         for shot_id in _script_shot_ids(state):
             for p in _shot_output_paths(shot_id):
                 if p.exists():
                     p.unlink()
                     deleted_files.append(str(p))
         # Final videos
-        for v in getattr(state, "final_videos", []) or []:
+        for v in final_video_paths(state):
             vp = Path(v)
             if vp.exists():
-                vp.unlink()
-                deleted_files.append(str(vp))
-        if state.final_video:
-            vp = Path(state.final_video)
-            if vp.exists() and str(vp) not in deleted_files:
                 vp.unlink()
                 deleted_files.append(str(vp))
     except Exception:
         logger.warning("Failed to clean output files for %s", project_id, exc_info=True)
     state_path.unlink()
     # Remove queue records for this project
-    to_remove = [tid for tid, rec in _queue_records.items() if rec.get("project_id") == project_id]
-    for tid in to_remove:
-        _queue_records.pop(tid, None)
-        if tid in _queue_order:
-            _queue_order.remove(tid)
-    _save_queue()
+    queue_db.delete_project_tasks(project_id)
     return {"ok": True, "deleted": project_id, "files_removed": len(deleted_files)}
 
 
@@ -698,8 +614,7 @@ async def resume_project(project_id: str) -> dict[str, Any]:
 
 @app.post("/api/projects/{project_id}/rerun")
 async def rerun_project(project_id: str, req: RerunRequest) -> dict[str, Any]:
-    existing = _tasks.get(project_id)
-    if existing and not existing.done():
+    if queue_db.is_project_running(project_id):
         raise HTTPException(status_code=409, detail="Project is already running")
     try:
         stage = Stage(req.stage)
@@ -724,8 +639,7 @@ async def rerun_project(project_id: str, req: RerunRequest) -> dict[str, Any]:
 
 @app.post("/api/projects/{project_id}/cleanup")
 async def cleanup_project_stage(project_id: str, req: CleanupRequest) -> dict[str, Any]:
-    existing = _tasks.get(project_id)
-    if existing and not existing.done():
+    if queue_db.is_project_running(project_id):
         raise HTTPException(status_code=409, detail="Project is already running")
     try:
         stage = Stage(req.stage)
@@ -744,8 +658,7 @@ async def cleanup_project_stage(project_id: str, req: CleanupRequest) -> dict[st
 
 @app.post("/api/projects/{project_id}/shots/{shot_id}/cleanup")
 async def cleanup_project_shot(project_id: str, shot_id: str, req: ShotCleanupRequest) -> dict[str, Any]:
-    existing = _tasks.get(project_id)
-    if existing and not existing.done():
+    if queue_db.is_project_running(project_id):
         raise HTTPException(status_code=409, detail="Project is already running")
     state = _load_state(project_id)
     paths: list[str | Path] = list(_shot_output_paths(shot_id))
@@ -760,8 +673,7 @@ async def cleanup_project_shot(project_id: str, shot_id: str, req: ShotCleanupRe
 
 @app.post("/api/projects/{project_id}/shots/{shot_id}/rerun")
 async def rerun_project_shot(project_id: str, shot_id: str, req: ShotRerunRequest) -> dict[str, Any]:
-    existing = _tasks.get(project_id)
-    if existing and not existing.done():
+    if queue_db.is_project_running(project_id):
         raise HTTPException(status_code=409, detail="Project is already running")
     state = _load_state(project_id)
     paths: list[str | Path] = list(_shot_output_paths(shot_id))
@@ -769,10 +681,21 @@ async def rerun_project_shot(project_id: str, shot_id: str, req: ShotRerunReques
         paths.append(canonical_shot(shot_id, ROOT / "assets"))
     deleted = [_delete_file(path) for path in paths] if req.delete_files else []
     _cleanup_shot_state(state, shot_id, req.include_asset)
+    task = None
     if req.start:
-        _start_background(PipelineOrchestrator(state))
+        task = _enqueue(
+            "rerun_shot",
+            project_id,
+            {
+                "shot_id": shot_id,
+                "include_asset": req.include_asset,
+                "delete_files": req.delete_files,
+            },
+            _model_task_runner,
+        )
     data = _state_to_dict(state)
     data["deleted"] = deleted
+    data["queued_task"] = task
     return data
 
 
@@ -829,11 +752,10 @@ async def cancel_queue_task(task_id: str) -> dict[str, Any]:
     if task_id == _active_queue_task_id and _queue_runner and not _queue_runner.done():
         _queue_runner.cancel()
         _queue_runner = None
+    elif record.get("status") == "queued" and task_id in _pending_queue_ids:
+        _pending_queue_ids.remove(task_id)
     _task_record(task_id, "canceled", "Task canceled by user")
-    # Restart worker if there are still queued tasks
-    queue = _ensure_queue()
-    if (_queue_runner is None or _queue_runner.done()) and not queue.empty():
-        _queue_runner = asyncio.create_task(_queue_worker())
+    _ensure_queue_worker()
     project_id = record.get("project_id")
     if project_id:
         try:

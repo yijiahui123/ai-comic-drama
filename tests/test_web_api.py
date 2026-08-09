@@ -158,6 +158,30 @@ class WebApiTests(unittest.TestCase):
                 self.assertFalse(shot.exists())
                 self.assertEqual(res.json()["current_stage"], "ASSET_GEN")
 
+    def test_shot_rerun_start_uses_queue_not_background_task(self):
+        state = PipelineState(project_id="abc123", user_prompt="测试项目", script=self._script())
+        web_server._queue_records.clear()
+        web_server._queue_order.clear()
+        web_server._pending_queue_ids.clear()
+        web_server._active_queue_task_id = None
+        web_server._queue_runner = None
+
+        with (
+            patch.object(web_server, "_load_state", lambda project_id: state),
+            patch.object(PipelineState, "save", lambda self, state_dir=Path("output/state"), force=False: Path("state.json")),
+            patch.object(web_server, "_start_background") as start_background,
+            patch("utils.production.load_asset_manifest", return_value={"shots": {}, "scenes": {}, "characters": {}, "scene_audio": {}}),
+        ):
+            client = TestClient(web_server.app)
+            res = client.post(
+                "/api/projects/abc123/shots/S01-001/rerun",
+                json={"include_asset": False, "delete_files": False, "start": True},
+            )
+            self.assertEqual(res.status_code, 200)
+            self.assertIsNotNone(res.json()["queued_task"])
+            self.assertEqual(res.json()["queued_task"]["kind"], "rerun_shot")
+            start_background.assert_not_called()
+
     def test_validate_assets_endpoint_is_callable_without_model_services(self):
         expected = {"ok": True, "errors": [], "warnings": [], "config": {}, "manifest": {}}
         with patch.object(web_server, "validate_asset_setup", lambda: expected):

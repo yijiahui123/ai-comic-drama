@@ -13,6 +13,7 @@ from utils.production import (
     quality_check_shot,
     review_shot,
     scene_audio_segments,
+    set_shot_status,
     set_shot_lock,
     update_script_shot,
     validate_scene_segments,
@@ -114,12 +115,44 @@ class ProductionUtilityTests(unittest.TestCase):
             self.assertTrue(Path(manifest["zip"]).exists())
             self.assertTrue(Path(manifest["files"]["script"]).exists())
 
+    def test_export_project_copies_all_final_videos(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            final_a = root / "output/final/p1_ep01.mp4"
+            final_b = root / "output/final/p1_ep02.mp4"
+            final_a.parent.mkdir(parents=True)
+            final_a.write_bytes(b"a")
+            final_b.write_bytes(b"b")
+            state = PipelineState(
+                project_id="p1",
+                user_prompt="x",
+                script=sample_script(),
+                final_videos=[str(final_a), str(final_b)],
+                final_video=str(final_b),
+            )
+            with (
+                patch("utils.production.SUBTITLE_ROOT", root / "output/subtitles"),
+                patch("utils.production.load_asset_manifest", return_value={"shots": {}, "scenes": {}, "characters": {}, "scene_audio": {}}),
+            ):
+                manifest = export_project(state, root)
+            self.assertEqual(len(manifest["files"]["final_videos"]), 2)
+            self.assertTrue(Path(manifest["files"]["final_videos"][0]).exists())
+
     def test_review_shot_updates_review_queue(self):
         state = PipelineState(project_id="p1", user_prompt="x", script=sample_script())
         with patch("utils.production.load_asset_manifest", return_value={"shots": {}, "scenes": {}, "characters": {}, "scene_audio": {}}):
             shot = review_shot(state, "S01-001", "needs_retry", "bad frame")
         self.assertEqual(shot.review_status, "needs_retry")
         self.assertIn("S01-001", state.review_queue)
+
+    def test_shot_status_pairs_are_validated(self):
+        shot = ShotState(shot_id="S01-001")
+        set_shot_status(shot, "approved", "approved")
+        self.assertEqual(shot.status, "approved")
+        with self.assertRaises(ValueError):
+            set_shot_status(shot, "approved", "pending")
+        with self.assertRaises(ValueError):
+            set_shot_status(shot, "not_a_state")
 
     def test_validate_scene_segments_detects_overlap_and_gap(self):
         state = PipelineState(project_id="p1", user_prompt="x", script=sample_script())

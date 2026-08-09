@@ -75,6 +75,7 @@ class HTTPClient:
         self,
         method: str,
         path: str,
+        parse_json: bool = True,
         **kwargs: Any,
     ) -> Any:
         """Execute an HTTP request with retry logic.
@@ -82,10 +83,11 @@ class HTTPClient:
         Args:
             method: HTTP verb (``GET``, ``POST``, etc.).
             path: URL path relative to ``base_url``.
+            parse_json: Whether to parse the response as JSON.
             **kwargs: Extra arguments forwarded to :meth:`aiohttp.ClientSession.request`.
 
         Returns:
-            Parsed JSON response body.
+            Parsed JSON response body, or raw bytes if parse_json is False.
 
         Raises:
             aiohttp.ClientError: After all retries are exhausted.
@@ -99,7 +101,9 @@ class HTTPClient:
             try:
                 async with session.request(method, url, **kwargs) as resp:
                     resp.raise_for_status()
-                    return await resp.json()
+                    if parse_json:
+                        return await resp.json()
+                    return await resp.read()
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 last_exc = exc
                 if attempt <= self.retry_count:
@@ -128,23 +132,25 @@ class HTTPClient:
     # Public API
     # ------------------------------------------------------------------
 
-    async def get(self, path: str, **kwargs: Any) -> Any:
+    async def get(self, path: str, parse_json: bool = True, **kwargs: Any) -> Any:
         """HTTP GET.
 
         Args:
             path: URL path.
+            parse_json: Whether to parse the response as JSON.
             **kwargs: Forwarded to :meth:`aiohttp.ClientSession.request`.
         """
-        return await self._request("GET", path, **kwargs)
+        return await self._request("GET", path, parse_json=parse_json, **kwargs)
 
-    async def post(self, path: str, **kwargs: Any) -> Any:
+    async def post(self, path: str, parse_json: bool = True, **kwargs: Any) -> Any:
         """HTTP POST.
 
         Args:
             path: URL path.
+            parse_json: Whether to parse the response as JSON.
             **kwargs: Forwarded to :meth:`aiohttp.ClientSession.request`.
         """
-        return await self._request("POST", path, **kwargs)
+        return await self._request("POST", path, parse_json=parse_json, **kwargs)
 
     async def health_check(self, path: str = "/") -> bool:
         """Check whether the remote service is reachable.

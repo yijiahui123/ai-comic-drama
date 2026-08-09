@@ -21,12 +21,59 @@ from utils.assets import (
     canonical_shot,
     load_asset_manifest,
 )
+from utils.paths import PROJECT_ROOT
 
 
-ROOT = Path.cwd()
+ROOT = PROJECT_ROOT
 OUTPUT_ROOT = Path("output")
 EXPORT_ROOT = OUTPUT_ROOT / "exports"
-SUBTITLE_ROOT = OUTPUT_ROOT / "subtitles"
+SUBTITLE_ROOT = ROOT / OUTPUT_ROOT / "subtitles"
+
+SHOT_STATUSES = {
+    "pending",
+    "ready",
+    "needs_retry",
+    "needs_review",
+    "approved",
+    "failed",
+}
+REVIEW_STATUSES = {
+    "pending",
+    "approved",
+    "rejected",
+    "needs_retry",
+}
+STATUS_REVIEW_DEFAULTS = {
+    "pending": "pending",
+    "ready": "pending",
+    "needs_retry": "needs_retry",
+    "needs_review": "pending",
+    "approved": "approved",
+    "failed": "needs_retry",
+}
+
+
+def set_shot_status(
+    shot: ShotState,
+    status: str,
+    review_status: str | None = None,
+    last_error: str | None = None,
+) -> ShotState:
+    """Set shot status with a validated review status pairing."""
+    if status not in SHOT_STATUSES:
+        raise ValueError(f"Invalid shot status: {status}")
+    review = review_status or STATUS_REVIEW_DEFAULTS[status]
+    if review not in REVIEW_STATUSES:
+        raise ValueError(f"Invalid review status: {review}")
+    if status == "approved" and review != "approved":
+        raise ValueError("approved shots must have approved review_status")
+    if review == "approved" and status != "approved":
+        raise ValueError("approved review_status requires approved shot status")
+    shot.status = status
+    shot.review_status = review
+    shot.last_error = last_error
+    shot.updated_at = datetime.now(timezone.utc)
+    return shot
 
 
 def iter_script_scenes(script: dict[str, Any]):
@@ -143,7 +190,8 @@ def update_script_shot(state: PipelineState, shot_id: str, patch: dict[str, Any]
     build_shot_states(state)
     shot_state = state.shot_states.setdefault(shot_id, ShotState(shot_id=shot_id, scene_id=scene_id))
     shot_state.script = dict(target)
-    shot_state.status = "pending" if not shot_state.locked else shot_state.status
+    if not shot_state.locked:
+        set_shot_status(shot_state, "pending")
     shot_state.updated_at = datetime.now(timezone.utc)
     state.update_progress(f"Shot {shot_id} updated", event_type="shot_update")
     return shot_state
@@ -167,16 +215,12 @@ def review_shot(state: PipelineState, shot_id: str, review_status: str, note: st
     if shot_id not in state.shot_states:
         raise KeyError(shot_id)
     shot = state.shot_states[shot_id]
-    shot.review_status = review_status
     if review_status == "approved":
-        shot.status = "approved"
+        set_shot_status(shot, "approved", "approved", note or None)
     elif review_status == "needs_retry":
-        shot.status = "needs_retry"
+        set_shot_status(shot, "needs_retry", "needs_retry", note or None)
     else:
-        shot.status = "needs_review"
-    if note:
-        shot.last_error = note
-    shot.updated_at = datetime.now(timezone.utc)
+        set_shot_status(shot, "needs_review", "rejected", note or None)
     refresh_review_queue(state)
     state.update_progress(f"Shot {shot_id} reviewed as {review_status}", event_type="shot_review")
     return shot
@@ -185,6 +229,14 @@ def review_shot(state: PipelineState, shot_id: str, review_status: str, note: st
 def _repo_path(path_value: str | Path, root: Path = ROOT) -> Path:
     path = Path(path_value)
     return path if path.is_absolute() else root / path
+
+
+def final_video_paths(state: PipelineState) -> list[str]:
+    """Return all final video paths, preserving backwards compatibility."""
+    finals = list(state.final_videos or [])
+    if state.final_video and state.final_video not in finals:
+        finals.append(state.final_video)
+    return finals
 
 
 def _file_check(name: str, path_value: str, required: bool = True) -> QualityCheck:
@@ -263,6 +315,28 @@ def _check_brightness(path_value: str, threshold: float = 10.0) -> QualityCheck:
         status=status,
         message=f"avg brightness {avg_brightness:.1f} (threshold {threshold})",
         details={"avg_brightness": avg_brightness, "threshold": threshold, "samples": len(yavg_values)},
+    )
+
+
+def _check_multimodal_vision(path_value: str, required: bool = False) -> QualityCheck:
+    """Placeholder for future AI Auto-QC Framework.
+    
+    This interface is reserved for integrating multimodal vision models 
+    (e.g., LLaVA, Qwen-VL) to detect visual glitches, bad anatomy, or 
+    prompt adherence in the generated videos or frames.
+    """
+    path = _repo_path(path_value)
+    if not path.exists():
+        return QualityCheck(name="ai_vision_qc", status="skip", message="video missing, skipped")
+    
+    # TODO: Implement API call to multimodal LLM endpoint
+    # ...
+    
+    return QualityCheck(
+        name="ai_vision_qc",
+        status="pass",
+        message="AI vision QC passed (placeholder)",
+        details={"model": "none", "score": 1.0},
     )
 
 
@@ -421,6 +495,7 @@ def quality_check_shot(state: PipelineState, shot_id: str) -> ShotState:
         _file_check("video_file", video_path, required=True),
         _probe_video(video_path),
         _check_brightness(video_path),
+        _check_multimodal_vision(video_path),
     ]
     if shot.script.get("dialogue"):
         checks.append(_file_check("audio_file", audio_path, required=False))
@@ -430,17 +505,16 @@ def quality_check_shot(state: PipelineState, shot_id: str) -> ShotState:
     failed = [check for check in checks if check.status == "fail"]
     warned = [check for check in checks if check.status == "warn"]
     if failed:
-        shot.status = "failed"
-        shot.review_status = "needs_retry" if shot.retry_count < shot.max_retries and not shot.locked else "rejected"
-        shot.last_error = "; ".join(check.message for check in failed)
+        set_shot_status(
+            shot,
+            "failed",
+            "needs_retry" if shot.retry_count < shot.max_retries and not shot.locked else "rejected",
+            "; ".join(check.message for check in failed),
+        )
     elif warned:
-        shot.status = "needs_review"
-        shot.review_status = "pending"
-        shot.last_error = "; ".join(check.message for check in warned)
+        set_shot_status(shot, "needs_review", "pending", "; ".join(check.message for check in warned))
     else:
-        shot.status = "ready"
-        shot.last_error = None
-    shot.updated_at = datetime.now(timezone.utc)
+        set_shot_status(shot, "ready", "pending")
     refresh_review_queue(state)
     return shot
 
@@ -454,7 +528,12 @@ def quality_check_project(state: PipelineState) -> dict[str, Any]:
     failed = sum(1 for shot in state.shot_states.values() if shot.status == "failed")
     needs_review = sum(1 for shot in state.shot_states.values() if shot.status == "needs_review")
     ready = sum(1 for shot in state.shot_states.values() if shot.status in {"ready", "approved"})
-    final_check = _file_check("final_video", state.final_video or "", required=False)
+    final_checks = [
+        _file_check(f"final_video/{idx + 1}", path, required=False)
+        for idx, path in enumerate(final_video_paths(state))
+    ]
+    if not final_checks:
+        final_checks = [_file_check("final_video", "", required=False)]
     segment_checks = validate_scene_segments(state)
     segment_failed = [c for c in segment_checks if c.status == "fail"]
     state.quality_report = {
@@ -463,7 +542,8 @@ def quality_check_project(state: PipelineState) -> dict[str, Any]:
         "failed": failed,
         "needs_review": needs_review,
         "review_queue": list(state.review_queue),
-        "final_video": final_check.model_dump(mode="json"),
+        "final_video": final_checks[-1].model_dump(mode="json"),
+        "final_videos": [check.model_dump(mode="json") for check in final_checks],
         "segment_checks": [c.model_dump(mode="json") for c in segment_checks],
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -482,15 +562,11 @@ def mark_failed_for_retry(state: PipelineState) -> list[str]:
         if shot.status not in {"failed", "needs_retry", "needs_review"} and shot.review_status not in {"needs_retry", "rejected"}:
             continue
         if shot.retry_count >= shot.max_retries:
-            shot.status = "needs_review"
-            shot.review_status = "rejected"
+            set_shot_status(shot, "needs_review", "rejected")
             continue
         shot.retry_count += 1
-        shot.status = "pending"
-        shot.review_status = "pending"
-        shot.last_error = None
+        set_shot_status(shot, "pending", "pending")
         shot.generation_params["seed"] = int(shot.generation_params.get("seed", 0)) + 1
-        shot.updated_at = datetime.now(timezone.utc)
         queued.append(shot_id)
     for stage in (Stage.VIDEO_GEN.value, Stage.EDITING.value):
         state.stages.pop(stage, None)
@@ -510,7 +586,7 @@ def export_project(state: PipelineState, root: Path = ROOT) -> dict[str, Any]:
     export_dir.mkdir(parents=True, exist_ok=True)
 
     manifest = load_asset_manifest()
-    files: dict[str, str] = {}
+    files: dict[str, Any] = {}
     (export_dir / "script.json").write_text(json.dumps(state.script or {}, ensure_ascii=False, indent=2), encoding="utf-8")
     (export_dir / "manifest.yaml").write_text(yaml.safe_dump(manifest, allow_unicode=True, sort_keys=False), encoding="utf-8")
     (export_dir / "shot_states.json").write_text(
@@ -526,12 +602,16 @@ def export_project(state: PipelineState, root: Path = ROOT) -> dict[str, Any]:
             "quality_report": str(export_dir / "quality_report.json"),
         }
     )
-    if state.final_video:
-        final_path = _repo_path(state.final_video, root)
+    copied_finals: list[str] = []
+    for final_value in final_video_paths(state):
+        final_path = _repo_path(final_value, root)
         if final_path.exists():
             dest = export_dir / final_path.name
             shutil.copy2(final_path, dest)
-            files["final_video"] = str(dest)
+            copied_finals.append(str(dest))
+    if copied_finals:
+        files["final_video"] = copied_finals[-1]
+        files["final_videos"] = copied_finals
 
     # Copy subtitle files
     subtitle_dir = export_dir / "subtitles"

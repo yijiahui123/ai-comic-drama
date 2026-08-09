@@ -20,6 +20,7 @@ from typing import Any, Optional
 
 import aiohttp
 
+from utils.http_client import HTTPClient
 from utils.logger import get_logger
 from utils.validators import validate_script
 
@@ -107,7 +108,8 @@ class ScriptWriter:
         self._api_key = api_key
         self._outline_prompt = _load_prompt("system_outline.txt")
         self._scene_prompt = _load_prompt("system_scene.txt")
-        self._session: aiohttp.ClientSession | None = None
+        self._client: HTTPClient | None = None
+        self._timeout = aiohttp.ClientTimeout(total=300, connect=10)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -115,9 +117,19 @@ class ScriptWriter:
 
     async def close(self) -> None:
         """Close the underlying HTTP session."""
-        if self._session and not self._session.closed:
-            await self._session.close()
-            self._session = None
+        if self._client:
+            await self._client.close()
+            self._client = None
+
+    def _get_client(self) -> HTTPClient:
+        if self._client is None:
+            self._client = HTTPClient(
+                self.base_url,
+                timeout=self._timeout,
+                retry_count=_MAX_RETRIES,
+                retry_delay=_RETRY_DELAY,
+            )
+        return self._client
 
     async def __aenter__(self) -> "ScriptWriter":
         return self
@@ -201,41 +213,16 @@ class ScriptWriter:
             "temperature": temperature,
         }
 
-        last_exc: Exception = RuntimeError("No attempts made")
-        delay = _RETRY_DELAY
-        timeout = aiohttp.ClientTimeout(total=300, connect=10)
-
         headers: dict[str, str] = {}
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
 
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(timeout=timeout)
-
-        for attempt in range(1, _MAX_RETRIES + 2):
-            try:
-                async with self._session.post(
-                    f"{self.base_url}{_CHAT_COMPLETIONS_PATH}",
-                    json=payload,
-                    headers=headers,
-                ) as resp:
-                    resp.raise_for_status()
-                    data = await resp.json()
-                    return data["choices"][0]["message"]["content"]
-            except (aiohttp.ClientError, asyncio.TimeoutError, KeyError, IndexError) as exc:
-                last_exc = exc
-                if attempt <= _MAX_RETRIES:
-                    logger.warning(
-                        "LLM request failed (attempt %d/%d): %s — retrying in %.1fs",
-                        attempt,
-                        _MAX_RETRIES + 1,
-                        exc,
-                        delay,
-                    )
-                    await asyncio.sleep(delay)
-                    delay *= 2
-
-        raise RuntimeError(f"LLM unreachable after {_MAX_RETRIES + 1} attempts: {last_exc}") from last_exc
+        client = self._get_client()
+        try:
+            data = await client.post(_CHAT_COMPLETIONS_PATH, json=payload, headers=headers)
+            return data["choices"][0]["message"]["content"]
+        except Exception as exc:
+            raise RuntimeError(f"LLM unreachable after {_MAX_RETRIES + 1} attempts: {exc}") from exc
 
     async def _generate_outline(self, user_description: str) -> dict[str, Any]:
         """Phase 1: generate a high-level story outline.

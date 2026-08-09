@@ -193,6 +193,18 @@ class PipelineOrchestrator:
         self.logger.info(
             "Pipeline DONE — final_video=%s", self.state.final_video
         )
+
+        # Trigger background cleanup of intermediate storage
+        try:
+            import subprocess
+            from utils.paths import PROJECT_ROOT
+            cleanup_script = PROJECT_ROOT / "scripts" / "cleanup_storage.py"
+            if cleanup_script.exists():
+                subprocess.Popen(["python3", str(cleanup_script), "--ttl", "7"])
+                self.logger.info("Triggered background storage cleanup")
+        except Exception as exc:
+            self.logger.warning("Failed to trigger background storage cleanup: %s", exc)
+
         return self.state
 
     def status(self) -> str:

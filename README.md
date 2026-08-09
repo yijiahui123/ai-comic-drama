@@ -6,6 +6,35 @@
 
 ---
 
+## 当前推荐运行模式
+
+项目现在有两条入口：
+
+- **Web 生产台**：`web_server.py`，默认不启动真实模型服务，适合做项目管理、资源库管理、镜头编辑、质检、审核、重试标记、导出包。
+- **CLI 真实流水线**：`main.py`，按原始流程调用 LLM、ComfyUI、Wan2.2、TTS、剪辑服务，适合真实生成。
+
+Web 生产台默认是安全模式：
+
+```bash
+conda run -n ai-comic uvicorn web_server:app --host 127.0.0.1 --port 8080
+```
+
+默认情况下，Web 端创建项目、恢复、重跑、失败重试都会进入本地队列，但不会真实调用 ComfyUI/Wan/LLM/TTS。这样可以在不占显存的情况下完成控制台、状态、审核和导出闭环。
+
+如果确认本地模型服务都已经启动，并且希望 Web 端真实执行生成任务，再显式打开：
+
+```bash
+AI_COMIC_ENABLE_MODEL_TASKS=1 conda run -n ai-comic uvicorn web_server:app --host 127.0.0.1 --port 8080
+```
+
+生产建议：
+
+- 没调通模型服务前，先用 Web 安全模式检查资源、脚本、镜头状态、质检和导出。
+- 真正出片时，再启动对应模型服务，并开启 `AI_COMIC_ENABLE_MODEL_TASKS=1`。
+- CLI `python main.py` 仍保留为直接跑完整流水线的入口。
+
+---
+
 ## 架构概览
 
 ```

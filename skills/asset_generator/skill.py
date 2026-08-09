@@ -46,7 +46,8 @@ from utils.paths import PROJECT_ROOT
 
 logger = get_logger(__name__)
 
-from utils.comfyui import post_with_retry as _post_with_retry, poll_comfyui_ws as _poll_comfyui_ws
+from utils.http_client import HTTPClient
+from utils.comfyui import poll_comfyui_ws as _poll_comfyui_ws
 
 # Default paths to ComfyUI workflow template files
 _WORKFLOWS_DIR = Path(__file__).parent / "workflows"
@@ -105,7 +106,7 @@ class AssetGenerator:
         self.assets_root = Path(assets_root)
         self._progress_callback = progress_callback
         self._shot_progress_callback = shot_progress_callback
-        self._session: Optional[aiohttp.ClientSession] = None
+        self._client: Optional[HTTPClient] = None
         self._asset_config = load_asset_config()
         self._library = AssetLibrary(load_asset_manifest(), self._asset_config)
         self.asset_sources: dict[str, dict[str, str]] = {
@@ -120,14 +121,13 @@ class AssetGenerator:
     # ------------------------------------------------------------------
 
     async def __aenter__(self) -> "AssetGenerator":
-        self._session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=30, connect=10)
-        )
+        self._client = HTTPClient(self.comfyui_url, timeout=aiohttp.ClientTimeout(total=30, connect=10))
+        await self._client.__aenter__()
         return self
 
     async def __aexit__(self, *_: Any) -> None:
-        if self._session and not self._session.closed:
-            await self._session.close()
+        if self._client:
+            await self._client.__aexit__()
 
     # ------------------------------------------------------------------
     # Public API
@@ -135,13 +135,8 @@ class AssetGenerator:
 
     async def health_check(self) -> bool:
         """Return ``True`` if ComfyUI is reachable."""
-        url = f"{self.comfyui_url}/"
-        session = self._get_session()
-        try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                return resp.status < 400
-        except Exception:  # noqa: BLE001
-            return False
+        client = self._get_client()
+        return await client.health_check()
 
     async def generate_all_assets(self, script: dict[str, Any]) -> dict[str, list[Path]]:
         """Generate all assets required by *script*.
@@ -601,7 +596,7 @@ class AssetGenerator:
         Returns:
             The filename assigned by ComfyUI, or ``None`` on failure.
         """
-        session = self._get_session()
+        client = self._get_client()
         try:
             data = aiohttp.FormData()
             with open(image_path, "rb") as fh:
@@ -611,13 +606,8 @@ class AssetGenerator:
                     filename=image_path.name,
                     content_type="image/png",
                 )
-            async with session.post(
-                f"{self.comfyui_url}{_COMFYUI_UPLOAD_PATH}",
-                data=data,
-            ) as resp:
-                resp.raise_for_status()
-                result = await resp.json()
-                return result.get("name")
+            result = await client.post(_COMFYUI_UPLOAD_PATH, data=data)
+            return result.get("name")
         except Exception as exc:  # noqa: BLE001
             logger.error("Failed to upload image %s: %s", image_path, exc)
             return None
@@ -636,18 +626,13 @@ class AssetGenerator:
         """
         client_id = str(uuid.uuid4())
         payload = {"prompt": workflow, "client_id": client_id}
-        session = self._get_session()
+        client = self._get_client()
 
         # Submit
         try:
-            data = await _post_with_retry(
-                session, f"{self.comfyui_url}{_COMFYUI_PROMPT_PATH}", payload,
-            )
+            data = await client.post(_COMFYUI_PROMPT_PATH, json=payload)
             prompt_id: str = data["prompt_id"]
-        except (ConnectionError, TimeoutError) as exc:
-            logger.error("ComfyUI prompt submission failed: %s", exc)
-            return None
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.error("ComfyUI prompt submission failed: %s", exc)
             return None
 
@@ -676,12 +661,8 @@ class AssetGenerator:
         while time.monotonic() < deadline:
             await asyncio.sleep(_POLL_INTERVAL)
             try:
-                async with session.get(
-                    f"{self.comfyui_url}{_COMFYUI_HISTORY_PATH.format(prompt_id=prompt_id)}"
-                ) as resp:
-                    resp.raise_for_status()
-                    history = await resp.json()
-            except Exception as exc:  # noqa: BLE001
+                history = await client.get(_COMFYUI_HISTORY_PATH.format(prompt_id=prompt_id))
+            except Exception as exc:
                 logger.warning("ComfyUI history poll failed: %s", exc)
                 continue
 
@@ -702,22 +683,18 @@ class AssetGenerator:
         # WS said done but HTTP didn't find it — retry once
         if ws_done:
             try:
-                async with session.get(
-                    f"{self.comfyui_url}{_COMFYUI_HISTORY_PATH.format(prompt_id=prompt_id)}"
-                ) as resp:
-                    resp.raise_for_status()
-                    history = await resp.json()
-                    if prompt_id in history:
-                        for node_output in history[prompt_id].get("outputs", {}).values():
-                            images = node_output.get("images", [])
-                            if images:
-                                image_info = images[0]
-                                return await self._download_image(
-                                    image_info["filename"],
-                                    image_info.get("subfolder", ""),
-                                    image_info.get("type", "output"),
-                                )
-            except Exception:  # noqa: BLE001
+                history = await client.get(_COMFYUI_HISTORY_PATH.format(prompt_id=prompt_id))
+                if prompt_id in history:
+                    for node_output in history[prompt_id].get("outputs", {}).values():
+                        images = node_output.get("images", [])
+                        if images:
+                            image_info = images[0]
+                            return await self._download_image(
+                                image_info["filename"],
+                                image_info.get("subfolder", ""),
+                                image_info.get("type", "output"),
+                            )
+            except Exception:
                 pass
 
         logger.error("ComfyUI workflow timed out after %.0fs", _POLL_TIMEOUT)
@@ -737,23 +714,17 @@ class AssetGenerator:
             Raw image bytes, or ``None`` on failure.
         """
         params = {"filename": filename, "subfolder": subfolder, "type": image_type}
-        session = self._get_session()
+        client = self._get_client()
         try:
-            async with session.get(
-                f"{self.comfyui_url}{_COMFYUI_VIEW_PATH}", params=params
-            ) as resp:
-                resp.raise_for_status()
-                return await resp.read()
-        except Exception as exc:  # noqa: BLE001
+            return await client.get(_COMFYUI_VIEW_PATH, parse_json=False, params=params)
+        except Exception as exc:
             logger.error("Failed to download image %s: %s", filename, exc)
             return None
 
-    def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=30, connect=10)
-            )
-        return self._session
+    def _get_client(self) -> HTTPClient:
+        if self._client is None:
+            self._client = HTTPClient(self.comfyui_url, timeout=aiohttp.ClientTimeout(total=30, connect=10))
+        return self._client
 
     def _report(self, message: str, current: int, total: int) -> None:
         """Invoke the progress callback if one was provided."""
